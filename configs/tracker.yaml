@@ -1,0 +1,49 @@
+camera:
+  width: 640
+  height: 480
+  fps: 60
+
+yolo:
+  enabled: true
+  model_path: "weights/best.pt"
+  class_name: "tennis ball"
+  confidence: 0.35
+  imgsz: 640
+  device: 0
+  periodic_interval_ms: 300
+  request_when_confidence_below: 3
+
+hsv:
+  # Typical tennis-ball yellow-green. Calibrate in your real light.
+  lower: [25, 70, 70]
+  upper: [45, 255, 255]
+  erode_iterations: 1
+  dilate_iterations: 2
+  min_area: 40
+  max_area: 20000
+  min_circularity: 0.45
+  min_mask_fill_ratio: 0.18
+  max_aspect_ratio: 1.8
+
+roi:
+  enabled: true
+  base_margin_px: 60
+  velocity_margin_scale: 1.5
+  min_size_px: 96
+  max_size_px: 360
+
+filter:
+  alpha: 0.75
+  beta: 0.20
+  max_missing_frames: 12
+  prediction_latency_ms: 80
+
+display:
+  enabled: true
+  window_name: "tennis-ball-tracker"
+
+control:
+  enabled: false
+  deadband_px: 20
+  max_command: 1.0
+
