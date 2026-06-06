@@ -62,6 +62,9 @@ class TrackState:
     last_update: float = 0.0
     source: str = "none"
 
+    # 调试
+    last_radius_px: float = 0.0  # 最近一次检测的原始像素半径
+
     # 3D 扩展
     pos_3d: Optional[Vec3] = None  # 机器人坐标系中的当前位置
     vel_3d: Vec3 = (0.0, 0.0, 0.0)

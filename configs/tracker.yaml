@@ -19,6 +19,7 @@ hsv:
   upper: [50, 255, 255]
   erode_iterations: 1
   dilate_iterations: 2
+  close_iterations: 1
   min_area: 40
   max_area: 20000
   min_circularity: 0.45
@@ -50,9 +51,9 @@ control:
 # 单目3D几何 — 相机安装位姿 + 标定
 geometry:
   calibration_path: "configs/calibration.npz"
-  ball_diameter_m: 0.067      # 标准网球直径 (米)
-  camera_height_m: 0.30       # 相机距地面高度 (米)
-  camera_pitch_deg: 20.0      # 俯仰角 (度), 正值 = 向下倾斜
+  ball_diameter_m: 0.093      # 补偿标定尺度误差 (真实球径0.065m)
+  camera_height_m: 0.258       # 相机距地面高度 (米)
+  camera_pitch_deg: 0.0      # 俯仰角 (度), 正值 = 向下倾斜
   camera_yaw_deg: 0.0         # 偏航角 (度), 0 = 正前方
 
 # 3D轨迹预测

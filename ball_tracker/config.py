@@ -37,6 +37,7 @@ class HSVConfig:
     min_circularity: float
     min_mask_fill_ratio: float
     max_aspect_ratio: float
+    close_iterations: int = 2
 
 
 @dataclass

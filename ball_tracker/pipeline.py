@@ -122,6 +122,7 @@ class TrackerPipeline:
 
         u, v = detection.center
         radius_px = detection.radius
+        self.state.last_radius_px = radius_px
         pos_3d = detect_to_robot_3d(
             u, v, radius_px, self.calib, self.camera_pose,
             real_diameter_m=self.cfg.geometry.ball_diameter_m,
@@ -224,6 +225,11 @@ class TrackerPipeline:
         lines = [
             f"{self.state.source} conf={self.state.confidence} miss={self.state.missing_frames}",
         ]
+        # debug: raw radius + depth formula
+        if self.state.last_radius_px > 0 and self.calib is not None:
+            r = self.state.last_radius_px
+            zc_raw = self.calib.focal_mean * self.cfg.geometry.ball_diameter_m / (2.0 * r)
+            lines.append(f"r={r:.1f}px  Zc=f*D/(2r)={zc_raw:.3f}m")
         # 3D position
         if self.state.pos_3d is not None:
             x, y, z = self.state.pos_3d

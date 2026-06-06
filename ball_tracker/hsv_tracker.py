@@ -44,14 +44,22 @@ class HSVTracker:
         if candidate is None:
             return None
 
-        x, y, w, h, area, circularity, fill_ratio = candidate
+        x, y, w, h, area, circularity, fill_ratio, contour = candidate
         if not self._passes_shape_checks(w, h, area, circularity, fill_ratio):
             return None
 
         cx = roi.x1 + x + w / 2.0
         cy = roi.y1 + y + h / 2.0
         bbox: BBox = (roi.x1 + x, roi.y1 + y, roi.x1 + x + w, roi.y1 + y + h)
-        radius = 0.25 * (w + h)
+
+        # 用 fitEllipse 做最小二乘椭圆拟合 — 对膨胀噪声比 minEnclosingCircle 更鲁棒
+        if len(contour) >= 5:
+            ellipse = cv2.fitEllipse(contour)
+            # ellipse = ((cx, cy), (major_axis, minor_axis), angle)
+            major, minor = ellipse[1]
+            radius = (major + minor) / 4.0
+        else:
+            radius = 0.25 * (w + h)
         confidence = min(0.99, 0.45 + circularity * 0.35 + fill_ratio * 0.20)
 
         return Detection(
@@ -66,6 +74,10 @@ class HSVTracker:
     def _make_mask(self, bgr: np.ndarray) -> np.ndarray:
         hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, self.lower, self.upper)
+        # close: dilate→erode, 填充掩码内部空洞并扩张至球边缘
+        if self.hsv_cfg.close_iterations > 0:
+            mask = cv2.dilate(mask, None, iterations=self.hsv_cfg.close_iterations)
+            mask = cv2.erode(mask, None, iterations=self.hsv_cfg.close_iterations)
         if self.hsv_cfg.erode_iterations > 0:
             mask = cv2.erode(mask, None, iterations=self.hsv_cfg.erode_iterations)
         if self.hsv_cfg.dilate_iterations > 0:
@@ -74,7 +86,7 @@ class HSVTracker:
 
     def _best_candidate(
         self, mask: np.ndarray
-    ) -> Optional[Tuple[int, int, int, int, float, float, float]]:
+    ) -> Optional[Tuple[int, int, int, int, float, float, float, np.ndarray]]:
         contours, _ = cv2.findContours(
             mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
@@ -82,6 +94,7 @@ class HSVTracker:
             return None
 
         best = None
+        best_contour = None
         best_score = -1.0
         for contour in contours:
             area = float(cv2.contourArea(contour))
@@ -98,8 +111,11 @@ class HSVTracker:
             if score > best_score:
                 best_score = score
                 best = (x, y, w, h, area, circularity, fill_ratio)
+                best_contour = contour
 
-        return best
+        if best is None:
+            return None
+        return (*best, best_contour)
 
     def _passes_shape_checks(
         self,
