@@ -18,7 +18,7 @@ def nothing(_: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Interactive HSV calibration tool.")
-    parser.add_argument("--source", default="0")
+    parser.add_argument("--source", default="1")
     args = parser.parse_args()
 
     cap = cv2.VideoCapture(parse_source(args.source))

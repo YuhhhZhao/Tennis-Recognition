@@ -1,7 +1,7 @@
 camera:
   width: 640
-  height: 480
-  fps: 60
+  height: 360
+  fps: 200
 
 yolo:
   enabled: true
@@ -15,8 +15,8 @@ yolo:
 
 hsv:
   # Typical tennis-ball yellow-green. Calibrate in your real light.
-  lower: [25, 70, 70]
-  upper: [45, 255, 255]
+  lower: [35, 70, 70]
+  upper: [50, 255, 255]
   erode_iterations: 1
   dilate_iterations: 2
   min_area: 40
@@ -46,4 +46,23 @@ control:
   enabled: false
   deadband_px: 20
   max_command: 1.0
+
+# 单目3D几何 — 相机安装位姿 + 标定
+geometry:
+  calibration_path: "configs/calibration.npz"
+  ball_diameter_m: 0.067      # 标准网球直径 (米)
+  camera_height_m: 0.30       # 相机距地面高度 (米)
+  camera_pitch_deg: 20.0      # 俯仰角 (度), 正值 = 向下倾斜
+  camera_yaw_deg: 0.0         # 偏航角 (度), 0 = 正前方
+
+# 3D轨迹预测
+trajectory:
+  gravity: -9.81              # 重力加速度 (m/s²), 负值 = 向下
+  min_samples_for_fit: 6      # 最少采集点数, 达到后才输出落点预测
+  max_history: 60             # 最大历史点数
+  target_height_m: 0.0        # 目标接球高度 (0 = 地面)
+  process_noise_pos: 0.01
+  process_noise_vel: 0.5
+  measurement_noise: 0.05
+  min_prediction_confidence: 0.3  # 置信度低于此值不输出落点
 

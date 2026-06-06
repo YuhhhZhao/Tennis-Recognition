@@ -70,6 +70,35 @@ class ControlConfig:
 
 
 @dataclass
+class CalibrationConfig:
+    path: str  # .npz 标定文件路径
+    cols: int = 9  # 棋盘格内角点列数
+    rows: int = 6  # 棋盘格内角点行数
+    square_size_m: float = 0.025  # 方格边长 (米)
+
+
+@dataclass
+class GeometryConfig:
+    calibration_path: str  # .npz 标定文件路径
+    ball_diameter_m: float = 0.067
+    camera_height_m: float = 0.3  # 相机距地面高度
+    camera_pitch_deg: float = 20.0  # 俯仰角 (正值=向下)
+    camera_yaw_deg: float = 0.0  # 偏航角
+
+
+@dataclass
+class TrajectoryConfig:
+    gravity: float = -9.81
+    min_samples_for_fit: int = 6
+    max_history: int = 60
+    target_height_m: float = 0.0
+    process_noise_pos: float = 0.01
+    process_noise_vel: float = 0.5
+    measurement_noise: float = 0.05
+    min_prediction_confidence: float = 0.3
+
+
+@dataclass
 class AppConfig:
     camera: CameraConfig
     yolo: YoloConfig
@@ -78,6 +107,8 @@ class AppConfig:
     filter: FilterConfig
     display: DisplayConfig
     control: ControlConfig
+    geometry: GeometryConfig
+    trajectory: TrajectoryConfig
 
 
 def load_config(path: Union[str, Path]) -> AppConfig:
@@ -92,4 +123,6 @@ def load_config(path: Union[str, Path]) -> AppConfig:
         filter=FilterConfig(**data["filter"]),
         display=DisplayConfig(**data["display"]),
         control=ControlConfig(**data["control"]),
+        geometry=GeometryConfig(**data.get("geometry", {})),
+        trajectory=TrajectoryConfig(**data.get("trajectory", {})),
     )
