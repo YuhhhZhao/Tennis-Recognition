@@ -7,3 +7,4 @@ runs/
 data/raw/
 data/datasets/
 
+tests/output/
