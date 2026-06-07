@@ -6,7 +6,7 @@ from typing import Optional
 
 import numpy as np
 
-from .state import Detection
+from ..state import Detection
 from .yolo_detector import YOLODetector
 
 

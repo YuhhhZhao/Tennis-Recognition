@@ -11,7 +11,7 @@
   - 结果保存到 configs/calibration.npz
 
 提示: 没有棋盘格? 运行:
-  python -c "from ball_tracker.calibration import generate_chessboard_png; generate_chessboard_png('chessboard.png')"
+  python -c "from tennis_tracker.prediction import generate_chessboard_png; generate_chessboard_png('chessboard.png')"
   然后用 A4 纸打印, 贴在平板上.
 """
 
@@ -27,7 +27,7 @@ import numpy as np
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from ball_tracker.prediction import calibrate_from_images, save_calibration
+from tennis_tracker.prediction import calibrate_from_images, save_calibration
 
 
 def parse_args() -> argparse.Namespace:

@@ -67,3 +67,10 @@ trajectory:
   measurement_noise: 0.05
   min_prediction_confidence: 0.3  # 置信度低于此值不输出落点
 
+# ESP32 下位板 UART 通信
+uart:
+  enabled: false                # 连上 TinyBee 后改为 true
+  port: "/dev/ttyTHS1"         # Jetson UART1 (J12 pin 8 TX, pin 10 RX)
+  baudrate: 115200             # 与 ESP32 固件一致
+  timeout_s: 0.05
+

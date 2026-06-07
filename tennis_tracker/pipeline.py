@@ -6,11 +6,15 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from .async_yolo import AsyncYOLOWorker
 from .config import AppConfig
-from .control import CarController
-from .filters import AlphaBetaFilter, clamp_point
-from .hsv_tracker import HSVTracker
+from .control import CarController, UartBridge
+from .detection import (
+    AlphaBetaFilter,
+    AsyncYOLOWorker,
+    HSVTracker,
+    YOLODetector,
+    clamp_point,
+)
 from .prediction import (
     BallisticSolver,
     CameraIntrinsics,
@@ -20,7 +24,8 @@ from .prediction import (
     load_calibration,
 )
 from .state import Detection, Detection3D, LandingPoint, TrackState, now
-from .yolo_detector import YOLODetector
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class TrackerPipeline:
@@ -41,6 +46,7 @@ class TrackerPipeline:
             cfg.control,
             frame_width=cfg.camera.width,
             frame_height=cfg.camera.height,
+            uart=self._init_uart(),
         )
 
         # ── 3D pipeline ──────────────────────────────────────────────
@@ -85,6 +91,8 @@ class TrackerPipeline:
             cap.release()
             if self.yolo_worker is not None:
                 self.yolo_worker.stop()
+            if self.controller.uart is not None:
+                self.controller.uart.close()
             cv2.destroyAllWindows()
 
     # ── step ─────────────────────────────────────────────────────────
@@ -250,6 +258,21 @@ class TrackerPipeline:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, c, 2,
             )
 
+    # ── UART ───────────────────────────────────────────────────────
+
+    def _init_uart(self) -> Optional[UartBridge]:
+        """初始化 ESP32 UART 桥, 失败返回 None."""
+        from .config import UartConfig
+
+        bridge = UartBridge(self.cfg.uart)
+        if self.cfg.uart.enabled:
+            if bridge.open():
+                print("[UART] Connected to ESP32 TinyBee")
+                return bridge
+            else:
+                print("[UART] ESP32 not available, will use print fallback")
+        return None
+
     # ── helpers ──────────────────────────────────────────────────────
 
     @staticmethod
@@ -257,6 +280,3 @@ class TrackerPipeline:
         if source.isdigit():
             return int(source)
         return str(Path(source))
-
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]

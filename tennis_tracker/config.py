@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Union
 
@@ -100,6 +100,14 @@ class TrajectoryConfig:
 
 
 @dataclass
+class UartConfig:
+    port: str = "/dev/ttyTHS1"  # Jetson UART1
+    baudrate: int = 115200
+    timeout_s: float = 0.05
+    enabled: bool = False
+
+
+@dataclass
 class AppConfig:
     camera: CameraConfig
     yolo: YoloConfig
@@ -110,6 +118,7 @@ class AppConfig:
     control: ControlConfig
     geometry: GeometryConfig
     trajectory: TrajectoryConfig
+    uart: UartConfig = field(default_factory=UartConfig)
 
 
 def load_config(path: Union[str, Path]) -> AppConfig:
@@ -126,4 +135,5 @@ def load_config(path: Union[str, Path]) -> AppConfig:
         control=ControlConfig(**data["control"]),
         geometry=GeometryConfig(**data.get("geometry", {})),
         trajectory=TrajectoryConfig(**data.get("trajectory", {})),
+        uart=UartConfig(**data.get("uart", {})),
     )

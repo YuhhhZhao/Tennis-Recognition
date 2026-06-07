@@ -6,8 +6,8 @@ from typing import Optional, Tuple
 import cv2
 import numpy as np
 
-from .config import HSVConfig, ROIConfig
-from .state import BBox, Detection, TrackState, now
+from ..config import HSVConfig, ROIConfig
+from ..state import BBox, Detection, TrackState, now
 
 
 @dataclass

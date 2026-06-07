@@ -15,30 +15,24 @@ Kalman + 重力模型：6D 状态滤波 → 抛物线落点预测
 ## 目录结构
 
 ```text
-tennis-ball-jetson-tracker/
-  ball_tracker/
-    prediction/             # ★ 3D 落点预测子包
-      __init__.py           #     公开 API 导出
-      geometry.py           #     单目 3D 几何 (像素→相机→机器人)
-      calibration.py        #     相机标定 (棋盘格) 加载/保存
-      trajectory.py         #     3D Kalman 轨迹滤波 + 抛物线落点求解
-    async_yolo.py           # 后台 YOLO 推理线程
+tennis-recognition/
+  tennis_tracker/
+    detection/              # 2D 识别 (HSV + YOLO + 滤波)
+    prediction/             # 3D 落点预测 (单目几何 + Kalman)
+    control/                # 电控 + 通信 (CarController + UART)
+    pipeline.py             # 主状态机
+    state.py                # 全部数据结构
     config.py               # YAML 配置加载
-    control.py              # 小车控制接口 (支持 2D 降级 + 3D 落点指令)
-    filters.py              # Alpha-Beta 位置/速度滤波
-    hsv_tracker.py          # HSV + ROI + 轮廓筛选
-    pipeline.py             # 主状态机 (2D → 3D → 轨迹 → 落点 → 控制)
-    state.py                # Detection / Detection3D / LandingPoint / TrackState
-    yolo_detector.py        # Ultralytics YOLO 封装
   configs/
-    tracker.yaml            # 默认参数 (含 camera / geometry / trajectory)
+    app.yaml                # 统一配置 (camera / hsv / geometry / trajectory / uart)
   scripts/
     run_tracker.py          # 运行入口
-    calibrate_hsv.py        # HSV 阈值标定工具
-    calibrate_camera.py     # ★ 棋盘格相机标定工具
-    export_yolo_tensorrt.py
+    calibrate_hsv.py        # HSV 阈值标定
+    calibrate_camera.py     # 棋盘格相机标定
+  firmware/
+    mecanum_controller/     # ESP32 麦轮控制固件
   tools/
-    train_yolo.md           # 数据采集和 YOLO 微调说明
+    train_yolo.md           # YOLO 训练说明
 ```
 
 ## 安装
@@ -59,22 +53,22 @@ Jetson 上如果已经装了系统版 OpenCV，先不要用 pip 覆盖 OpenCV。
 使用摄像头：
 
 ```bash
-python scripts/run_tracker.py --config configs/tracker.yaml --source 0
+python scripts/run_tracker.py --config configs/app.yaml --source 0
 ```
 
 只测 HSV，不加载 YOLO：
 
 ```bash
-python scripts/run_tracker.py --config configs/tracker.yaml --source 0 --no-yolo
+python scripts/run_tracker.py --config configs/app.yaml --source 0 --no-yolo
 ```
 
 使用视频文件：
 
 ```bash
-python scripts/run_tracker.py --config configs/tracker.yaml --source data/samples/test.mp4
+python scripts/run_tracker.py --config configs/app.yaml --source data/samples/test.mp4
 ```
 
-如果你已经有 YOLO 权重，把 `configs/tracker.yaml` 里的路径改掉：
+如果你已经有 YOLO 权重，把 `configs/app.yaml` 里的路径改掉：
 
 ```yaml
 yolo:
@@ -135,7 +129,7 @@ Camera Frame
 
 ```bash
 # 生成棋盘格 PNG，A4 打印贴在平板上
-python -c "from ball_tracker.prediction import generate_chessboard_png; generate_chessboard_png('chessboard.png')"
+python -c "from tennis_tracker.prediction import generate_chessboard_png; generate_chessboard_png('chessboard.png')"
 
 # 运行交互式标定
 python scripts/calibrate_camera.py --source 1 --pattern 9x6 --square 0.025
@@ -148,7 +142,7 @@ python scripts/calibrate_camera.py --source 1 --pattern 9x6 --square 0.025
 
 **Step 2 — 配置相机位姿**
 
-在 `configs/tracker.yaml` 的 `geometry` 段填入真实值：
+在 `configs/app.yaml` 的 `geometry` 段填入真实值：
 
 ```yaml
 geometry:
@@ -184,11 +178,11 @@ python scripts/run_tracker.py --source 1 --no-yolo
 python scripts/calibrate_hsv.py --source 0
 ```
 
-按 `q` 退出后，把显示出来的 HSV 范围写回 `configs/tracker.yaml`。
+按 `q` 退出后，把显示出来的 HSV 范围写回 `configs/app.yaml`。
 
 ## 小车控制接口
 
-默认的 `ball_tracker/control.py` 支持两种模式：
+默认的 `tennis_tracker/control/` 支持两种模式：
 
 - **3D 落点指令**（`send_landing`）: 基于预测的 3D 落点 (x, y, z) 生成 turn/forward
 - **2D 像素指令**（`send_target`）: 3D 不可用时降级为 2D 图像目标

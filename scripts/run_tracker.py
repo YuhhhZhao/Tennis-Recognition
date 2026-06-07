@@ -9,13 +9,13 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from ball_tracker.config import load_config
-from ball_tracker.pipeline import TrackerPipeline
+from tennis_tracker.config import load_config
+from tennis_tracker.pipeline import TrackerPipeline
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run YOLO warm-start + HSV tracker.")
-    parser.add_argument("--config", default="configs/tracker.yaml")
+    parser.add_argument("--config", default="configs/app.yaml")
     parser.add_argument("--source", default="0", help="Camera index or video path.")
     parser.add_argument("--yolo-model", help="Override YOLO model path.")
     parser.add_argument("--no-yolo", action="store_true", help="Use full-frame HSV init.")

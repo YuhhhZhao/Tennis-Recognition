@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Tuple
 
-from .state import Detection, Point, TrackState, now
+from ..state import Detection, Point, TrackState, now
 
 
 @dataclass
@@ -56,4 +56,3 @@ def clamp_point(point: Point, width: int, height: int) -> Tuple[int, int]:
     x = int(max(0, min(width - 1, point[0])))
     y = int(max(0, min(height - 1, point[1])))
     return x, y
-

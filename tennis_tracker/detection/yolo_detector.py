@@ -5,8 +5,8 @@ from typing import Optional
 
 import numpy as np
 
-from .config import YoloConfig
-from .state import Detection, now
+from ..config import YoloConfig
+from ..state import Detection, now
 
 
 class YOLODetector:
@@ -21,7 +21,7 @@ class YOLODetector:
         if not Path(self.cfg.model_path).exists():
             raise FileNotFoundError(
                 f"YOLO model not found: {self.cfg.model_path}. "
-                "Train/export a model or edit configs/tracker.yaml."
+                "Train/export a model or edit configs/app.yaml."
             )
 
         from ultralytics import YOLO
