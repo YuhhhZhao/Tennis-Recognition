@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -24,6 +25,15 @@ from .prediction import (
     load_calibration,
 )
 from .state import Detection, Detection3D, LandingPoint, TrackState, now
+
+# ── IMU + 里程计定位 (可选) ──
+try:
+    from tennis_robot_sim.estimation.odometry import OdomTracker
+    from tennis_robot_sim.imu import ComplementaryLocalizer, WitMotionIMU
+    from tennis_robot_sim.data import ControlCommand as SimCommand
+    _LOCALIZATION_AVAILABLE = True
+except ImportError:
+    _LOCALIZATION_AVAILABLE = False
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -61,6 +71,22 @@ class TrackerPipeline:
         self.ballistic = BallisticSolver(cfg.trajectory)
         self.latest_landing: Optional[LandingPoint] = None
 
+        # ── 定位 (IMU + 里程计) ──────────────────────────────────────
+        self.odom_tracker: Optional[OdomTracker] = None
+        self.imu: Optional[WitMotionIMU] = None
+        self.localizer: Optional[ComplementaryLocalizer] = None
+        self._last_odom_steps = None
+        self._loc_last_t = 0.0
+        self._last_odom_query = 0.0
+        if _LOCALIZATION_AVAILABLE:
+            self.odom_tracker = OdomTracker()
+            self.localizer = ComplementaryLocalizer({
+                "robot": {"start_pose": [0.0, 0.0, 0.0]},
+                "imu": {"yaw_complementary_alpha": 0.92},
+            })
+            self.localizer.reset()
+            # IMU 延迟到 run() 中连接, 避免阻塞导入
+
     def run(self) -> None:
         cap = cv2.VideoCapture(self.source)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.cfg.camera.width)
@@ -72,6 +98,18 @@ class TrackerPipeline:
 
         if self.yolo_worker is not None:
             self.yolo_worker.start()
+
+        # ── 连接 IMU ──
+        if self.localizer is not None and _LOCALIZATION_AVAILABLE:
+            try:
+                self.imu = WitMotionIMU("/dev/ttyACM0", 115200)
+                if self.imu.open():
+                    print("[LOC] IMU + 里程计定位已启用")
+                    self._loc_last_t = time.monotonic()
+            except Exception as e:
+                print(f"[LOC] IMU 连接失败: {e}")
+                self.imu = None
+                self.localizer = None
 
         try:
             while True:
@@ -93,6 +131,8 @@ class TrackerPipeline:
                 self.yolo_worker.stop()
             if self.controller.uart is not None:
                 self.controller.uart.close()
+            if self.imu is not None:
+                self.imu.close()
             cv2.destroyAllWindows()
 
     # ── step ─────────────────────────────────────────────────────────
@@ -120,6 +160,7 @@ class TrackerPipeline:
 
         self._maybe_request_yolo(frame)
         self._send_control()
+        self._update_localization()
 
     def _update_3d(self, detection: Optional[Detection]) -> None:
         """从 2D 检测更新 3D 轨迹和落点预测."""
@@ -200,6 +241,46 @@ class TrackerPipeline:
             )
             self.controller.send_target(target)
 
+    # ── localization ─────────────────────────────────────────────────
+
+    def _update_localization(self) -> None:
+        """IMU + 里程计融合定位."""
+        if self.localizer is None or self.imu is None or self.odom_tracker is None:
+            return
+
+        now_t = time.monotonic()
+        dt = now_t - self._loc_last_t
+        self._loc_last_t = now_t
+        if dt <= 0:
+            return
+
+        # 1. IMU 采样
+        imu_sample = self.imu.get_sample()
+
+        # 2. 里程计 (每 100ms 从 ESP32 查询步数)
+        uart = self.controller.uart
+        if uart and uart.is_open and now_t - self._last_odom_query > 0.1:
+            steps_data = uart.send_ping()
+            self._last_odom_query = now_t
+            if steps_data is not None:
+                self.odom_tracker.update(steps_data.to_tuple())
+
+        # 3. 融合定位
+        # 用里程计推算的位移作为 odometry 输入
+        cmd = SimCommand(
+            v=0.0, omega=imu_sample.yaw_rate_radps  # 用 IMU 角速度近似
+        )
+        self.localizer.predict(cmd, dt)
+        self.localizer.update_imu(imu_sample, dt)
+
+        # 用里程计位姿更新 (权重 0.08 = 信任 IMU 更多)
+        odom_x, odom_y, odom_yaw = self.odom_tracker.pose
+        from tennis_robot_sim.data import RobotState as SimState
+        self.localizer.update_odometry(
+            SimState(x=odom_x, y=odom_y, yaw=odom_yaw),
+            weight=0.15,
+        )
+
     # ── draw ─────────────────────────────────────────────────────────
 
     def _draw(self, frame) -> None:
@@ -207,7 +288,7 @@ class TrackerPipeline:
 
         # --- status bar background ---
         overlay = frame.copy()
-        cv2.rectangle(overlay, (0, 0), (width, 100), (0, 0, 0), -1)
+        cv2.rectangle(overlay, (0, 0), (width, 120), (0, 0, 0), -1)
         frame[:] = cv2.addWeighted(frame, 0.6, overlay, 0.4, 0)
 
         if self.state.center is None:
@@ -249,10 +330,17 @@ class TrackerPipeline:
             lines.append(
                 f"Land: ({lx:.2f}, {ly:.2f}, {lz:.2f})m t={lp.t_arrival:.2f}s"
             )
+        # localization pose
+        if self.localizer is not None:
+            state = self.localizer.get_state()
+            lines.append(
+                f"LOC: ({state.x:.2f}, {state.y:.2f}) yaw={state.yaw*57.3:.0f}°"
+            )
+
         # draw text lines
         y0 = 28
         for i, txt in enumerate(lines):
-            c = [(0, 255, 0), (255, 255, 0), (0, 255, 255)][i % 3]
+            c = [(0, 255, 0), (255, 255, 0), (0, 255, 255), (255, 0, 255)][i % 4]
             cv2.putText(
                 frame, txt, (12, y0 + i * 22),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, c, 2,

@@ -17,9 +17,12 @@ MICROSTEPS = 8
 FULL_STEPS_PER_REV = 200
 STEPS_PER_REV = FULL_STEPS_PER_REV * MICROSTEPS  # 1600
 WHEEL_RADIUS_M = 0.023
-LX = 0.15  # 轴距 X
-LY = 0.12  # 轮距 Y
-L_SUM = LX + LY  # 0.27
+# 物理实测: LX=0.096m, LY=0.097m, L_SUM=0.193m (轮中心距÷2)
+# IMU标定: L_SUM_eff=0.173m (麦轮辊子打滑导致有效力臂缩短)
+# 下面使用IMU标定值确保里程计追踪精度
+LX = 0.086
+LY = 0.087
+L_SUM = LX + LY  # 0.173 (IMU校准)
 
 # 每步对应的轮子位移 (m)
 STEP_TO_M = (2.0 * math.pi * WHEEL_RADIUS_M) / STEPS_PER_REV

@@ -57,7 +57,10 @@ const MotorBits MB[4] = {
 const int   MICROSTEPS    = 8;
 const int   STEPS_PER_REV = 200 * MICROSTEPS;  // 1600
 const float WHEEL_RADIUS  = 0.023f;
-const float LX = 0.15f, LY = 0.12f, L_SUM = LX + LY;  // 0.27
+// 物理实测: LX=0.096m, LY=0.097m, L_SUM=0.193m (轮中心距÷2)
+// IMU标定: L_SUM_eff=0.173m (麦轮辊子打滑导致有效力臂缩短)
+// 下面使用IMU标定值确保转弯精度
+const float LX = 0.086f, LY = 0.087f, L_SUM = LX + LY;  // 0.173 (IMU校准)
 const float INV_R_DIV_2PI = 1.0f / (WHEEL_RADIUS * 2.0f * PI);
 
 const uint32_t VEL_TIMEOUT_MS = 1000;

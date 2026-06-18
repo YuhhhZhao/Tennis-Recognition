@@ -59,8 +59,8 @@ geometry:
 # 3D轨迹预测
 trajectory:
   gravity: -9.81              # 重力加速度 (m/s²), 负值 = 向下
-  min_samples_for_fit: 6      # 最少采集点数, 达到后才输出落点预测
-  max_history: 60             # 最大历史点数
+  min_samples_for_fit: 15     # 最少采集点数, 达到后才输出落点预测
+  max_history: 30             # 最大历史点数 (丢弃旧数据)
   target_height_m: 0.0        # 目标接球高度 (0 = 地面)
   process_noise_pos: 0.01
   process_noise_vel: 0.5
