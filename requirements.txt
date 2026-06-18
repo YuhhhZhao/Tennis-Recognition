@@ -1,5 +1,6 @@
 numpy>=1.23
 opencv-python>=4.8
 PyYAML>=6.0
+matplotlib>=3.5
+pytest>=7.0
 ultralytics>=8.2
-

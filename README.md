@@ -1,15 +1,48 @@
 # Tennis Ball Jetson Tracker
 
-面向 `NVIDIA Jetson + 相机 + 小车 + 挡网垃圾桶` 的网球检测、3D 轨迹预测与跟踪示例工程。
+面向 `NVIDIA Jetson + 相机 + IMU + 麦轮小车` 的网球检测、3D 轨迹预测、IMU 定位与机器人拦截系统。
 
-核心策略：
+## 硬件连接
 
-```text
-YOLO 全图检测：慢但稳，用于热启动、丢失重定位、周期校正
-HSV ROI 跟踪：快但脆，用于连续毫秒级跟踪
-Alpha-Beta Filter：估计速度并预测下一帧位置，抵消推理和控制延迟
-单目 3D 估计：利用已知网球直径 (6.7cm) 估算深度 → 机器人坐标系
-Kalman + 重力模型：6D 状态滤波 → 抛物线落点预测
+```
+Jetson USB-A
+  ├── DCXIN Camera    → /dev/video0        (UVC 相机, 640×360)
+  ├── ESP32 (CH340)   → /dev/ttyCH341USB0  (小车控制, 115200)
+  └── WitMotion IMU   → /dev/ttyACM0       (IMU姿态, 115200)
+```
+
+| 设备 | USB VID:PID | 设备节点 | 协议 |
+|------|-------------|----------|------|
+| 相机 DCXIN | `1bcf:2d50` | `/dev/video0` | UVC |
+| ESP32 小车 | `1a86:7523` | `/dev/ttyCH341USB0` | UART 115200 |
+| WitMotion IMU | `19f5:5740` | `/dev/ttyACM0` | USB CDC ACM 115200 |
+
+### CH340 驱动问题 (Jetson)
+
+Jetson 上 `brltty` 服务会抢占 CH340 串口设备。解决：
+
+```bash
+sudo systemctl mask brltty --now
+sudo systemctl mask brltty-udev.service
+```
+
+CH340 变体 `1a86:7523` 不被内核 ch341 驱动识别，需写入 `new_id`：
+
+```bash
+sudo sh -c 'echo "1a86 7523" > /sys/bus/usb/drivers/usb_ch341/new_id'
+```
+
+项目包含 WCH 官方编译好的驱动 `CH341SER_LINUX/driver/ch341.ko`，可加载：
+
+```bash
+sudo rmmod ch341
+sudo insmod CH341SER_LINUX/driver/ch341.ko
+```
+
+### IMU 权限
+
+```bash
+sudo chmod 666 /dev/ttyCH341USB0 /dev/ttyACM0
 ```
 
 ## 目录结构
@@ -23,182 +56,174 @@ tennis-recognition/
     pipeline.py             # 主状态机
     state.py                # 全部数据结构
     config.py               # YAML 配置加载
+  tennis_robot_sim/
+    estimation/
+      odometry.py           # 麦轮里程计 (步数→位移正解算)
+      trajectory.py         # 落点预测
+      geometry.py           # 图像/世界坐标转换
+    imu/
+      witmotion.py          # WitMotion 真实 IMU 驱动
+      localization.py       # 互补滤波器 (IMU+里程计融合)
+      sim_imu.py            # 仿真 IMU
+    robot/                  # 运动学/规划/控制
+    sim/                    # 仿真环境 (球/相机/场景)
   configs/
-    app.yaml                # 统一配置 (camera / hsv / geometry / trajectory / uart)
-  scripts/
-    run_tracker.py          # 运行入口
-    calibrate_hsv.py        # HSV 阈值标定
-    calibrate_camera.py     # 棋盘格相机标定
+    app.yaml                # 真实硬件配置
+    default_sim.yaml        # 仿真配置
   firmware/
     mecanum_controller/     # ESP32 麦轮控制固件
-  tools/
-    train_yolo.md           # YOLO 训练说明
+  scripts/
+    run_tracker.py          # 完整跟踪管线入口
+    test_car_move.py        # 小车运动测试
+    test_imu.py             # IMU 数据读取测试
+    test_imu_localization.py # IMU+定位器集成测试
+    test_imu_vs_odometry.py  # IMU vs 里程计对比测试
+    diag_serial.py          # 串口诊断工具
+    calibrate_hsv.py        # HSV 阈值标定
+    calibrate_camera.py     # 棋盘格相机标定
+  weights/                  # YOLO 模型权重
+    best_v3.pt              # 推荐使用
+    best.pt
+    yolov8n.pt
 ```
 
 ## 安装
 
-建议先在普通电脑上调通，再部署到 Jetson。
+### Conda 环境 (推荐)
 
 ```bash
-cd /Users/zzzyhh123/projects/tennis-ball-jetson-tracker
-python3 -m venv .venv
-source .venv/bin/activate
+conda activate tennis
 pip install -r requirements.txt
+
+# Jetson GPU PyTorch (系统预装)
+# 在 conda 环境中添加系统 torch 路径:
+echo "/usr/local/lib/python3.10/dist-packages" > $(python -c "import site; print(site.getsitepackages()[0])")/system-torch.pth
 ```
 
-Jetson 上如果已经装了系统版 OpenCV，先不要用 pip 覆盖 OpenCV。
+> Jetson 系统预装了 NVIDIA GPU 版 PyTorch (`/usr/local/lib/python3.10/dist-packages/`)。
+> conda 环境需降级 numpy 以兼容: `pip install 'numpy<2'`
+
+## 核心策略
+
+```text
+YOLO 全图检测：慢但稳，用于热启动、丢失重定位、周期校正
+HSV ROI 跟踪：快但脆，用于连续毫秒级跟踪
+Alpha-Beta Filter：估计速度并预测下一帧位置，抵消推理和控制延迟
+单目 3D 估计：利用已知网球直径 (6.7cm) 估算深度 → 机器人坐标系
+Kalman + 重力模型：6D 状态滤波 → 抛物线落点预测
+IMU 互补滤波：陀螺仪修正里程计航向漂移
+麦轮里程计：ESP32 步数 → 正解算 → 车体位移 (x, y, yaw)
+```
 
 ## 运行
 
-使用摄像头：
-
-```bash
-python scripts/run_tracker.py --config configs/app.yaml --source 0
-```
-
-只测 HSV，不加载 YOLO：
+### 完整管线
 
 ```bash
 python scripts/run_tracker.py --config configs/app.yaml --source 0 --no-yolo
 ```
 
-使用视频文件：
+- `--source 0` = 相机 `/dev/video0`
+- `--no-yolo` = 纯 HSV 检测 (更快)
+- 不加 `--no-yolo` = YOLO + HSV 混合
+- 按 `q` 退出
+
+### 仅测试小车运动
 
 ```bash
-python scripts/run_tracker.py --config configs/app.yaml --source data/samples/test.mp4
+python scripts/test_car_move.py
 ```
 
-如果你已经有 YOLO 权重，把 `configs/app.yaml` 里的路径改掉：
-
-```yaml
-yolo:
-  model_path: "weights/best.engine"
-```
-
-也可以临时指定：
+### 测试 IMU
 
 ```bash
-python scripts/run_tracker.py --source 0 --yolo-model weights/best.engine
+python scripts/test_imu.py                          # 实时显示姿态
+python scripts/test_imu_localization.py              # IMU+定位器集成
+python scripts/test_imu_vs_odometry.py               # IMU vs 里程计对比
 ```
 
-Jetson 推荐使用 TensorRT engine：
-
-```text
-best.pt -> best.onnx -> best.engine
-```
-
-也可以使用 Ultralytics 直接导出：
+### 串口诊断
 
 ```bash
-python scripts/export_yolo_tensorrt.py --weights weights/best.pt --imgsz 640
+python scripts/diag_serial.py
 ```
 
-## 工作逻辑
+## 小车控制协议
 
-1. 启动时没有目标，主循环把当前帧交给 YOLO worker。
-2. YOLO 找到网球后，得到初始 bbox、中心点、半径估计。
-3. HSV tracker 只在预测位置附近裁剪 ROI，做颜色阈值、形态学、轮廓筛选。
-4. HSV 有效时高速更新目标状态，并发送控制指令。
-5. HSV 失败或置信度下降时，触发 YOLO 全图重定位。
-6. YOLO 也可以按固定间隔做低频校正，防止 HSV 漂移。
-7. **★ 3D 管线**: 2D 检测 → 单目深度估计 → 机器人坐标系 → Kalman 滤波 → 落点预测 → 控制指令。
+ESP32 固件 `mecanum_controller.ino` (v3.1):
+
+```
+Jetson → ESP32:   VEL <vx> <vy> <w>\n     (速度指令 m/s, rad/s)
+                   TARGET <x> <y> <t>\n     (落点指令 m, s)
+                   STOP\n                   (紧急停车)
+                   PING\n                   (查询步数)
+                   STAT\n                   (诊断状态)
+                   RESET_STEPS\n            (步数归零)
+
+ESP32 → Jetson:   OK\n
+                   PONG s=<s0>,<s1>,<s2>,<s3>\n  (四轮带符号步数)
+                   STOP_OK STEPS=<s0>,<s1>,<s2>,<s3>\n
+```
+
+### 里程计
+
+步数 → 位移在 Jetson 端 (`tennis_robot_sim/estimation/odometry.py`) 计算：
+
+```
+步数增量 × (2πR / 1600) = 轮位移 (m)
+四轮位移 → 麦轮正解算 → 车体位移 (dx, dy, dyaw)
+→ 旋转到世界坐标系 → 累积 (x, y, yaw)
+```
+
+### IMU 定位
+
+WitMotion IMU (`tennis_robot_sim/imu/witmotion.py`) 持续输出：
+
+| 数据类型 | 更新率 | 用途 |
+|----------|--------|------|
+| 角速度 (gyro Z) | ~1000 Hz | 航向修正 |
+| 加速度 | ~1000 Hz | 静止检测 |
+| 姿态角 (roll/pitch/yaw) | ~1000 Hz | 辅助参考 |
+
+互补滤波器 (`ComplementaryLocalizer`):
+
+```
+融合航向 = 0.92 × IMU积分航向 + 0.08 × 里程计航向
+```
+
+## 固件烧录
+
+用 Arduino IDE 打开 `firmware/mecanum_controller/mecanum_controller.ino`：
+
+1. 选择开发板: ESP32 Dev Module
+2. 端口: 对应 CH340 串口
+3. 点击上传
 
 ## 3D 落点预测
-
-### 原理
 
 ```
 Camera Frame
     ↓
 [HSV/YOLO Detection] → (u, v, radius_px)
     ↓
-[pixel_to_camera_frame] → (Xc, Yc, Zc) ← depth_from_ball_radius (已知网球直径 6.7cm)
+[pixel_to_camera_frame] → (Xc, Yc, Zc) ← depth_from_ball_radius
     ↓
-[camera_to_robot] → (Xr, Yr, Zr) ← CameraPose (相机高度 + 俯仰角)
+[camera_to_robot] → (Xr, Yr, Zr) ← CameraPose
     ↓
-[TrajectoryFilter] → 6D Kalman (x, y, z, vx, vy, vz) 带重力模型
+[TrajectoryFilter] → 6D Kalman 带重力模型
     ↓
-[BallisticSolver] → 解 z(t) == target_height → 落点 (x, y, z, t_arrival)
+[BallisticSolver] → 落点 (x, y, t_arrival)
     ↓
-[CarController] → turn, forward 指令
-```
-
-### 使能 3D 预测
-
-**Step 1 — 相机标定**（只需一次）
-
-```bash
-# 生成棋盘格 PNG，A4 打印贴在平板上
-python -c "from tennis_tracker.prediction import generate_chessboard_png; generate_chessboard_png('chessboard.png')"
-
-# 运行交互式标定
-python scripts/calibrate_camera.py --source 1 --pattern 9x6 --square 0.025
-```
-
-- 将棋盘格在相机视野内改变位置/角度
-- 看到彩色 overlay 时按 **空格** 保存
-- 采集 15-30 张后按 **q** 退出
-- 结果保存在 `configs/calibration.npz`
-
-**Step 2 — 配置相机位姿**
-
-在 `configs/app.yaml` 的 `geometry` 段填入真实值：
-
-```yaml
-geometry:
-  calibration_path: "configs/calibration.npz"
-  ball_diameter_m: 0.067      # 标准网球
-  camera_height_m: 0.30       # 相机距地面高度 (米)
-  camera_pitch_deg: 20.0      # 俯仰角 (正值 = 向下)
-  camera_yaw_deg: 0.0         # 偏航角, 0 = 正前方
-```
-
-**Step 3 — 运行**
-
-```bash
-python scripts/run_tracker.py --source 1 --no-yolo
-```
-
-界面左上角会显示 3D 位置和落点预测信息。无标定文件时 3D 模块自动降级为 no-op，2D 跟踪不受影响。
-
-### 配置项说明
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `trajectory.gravity` | -9.81 | 重力加速度 (m/s²) |
-| `trajectory.target_height_m` | 0.0 | 目标接球高度 (0=地面) |
-| `trajectory.min_samples_for_fit` | 6 | 至少收集 6 帧才开始落点预测 |
-| `trajectory.min_prediction_confidence` | 0.3 | 置信度阈值 |
-
-## HSV 标定
-
-先用标定工具调阈值：
-
-```bash
-python scripts/calibrate_hsv.py --source 0
-```
-
-按 `q` 退出后，把显示出来的 HSV 范围写回 `configs/app.yaml`。
-
-## 小车控制接口
-
-默认的 `tennis_tracker/control/` 支持两种模式：
-
-- **3D 落点指令**（`send_landing`）: 基于预测的 3D 落点 (x, y, z) 生成 turn/forward
-- **2D 像素指令**（`send_target`）: 3D 不可用时降级为 2D 图像目标
-
-实际项目里可以替换为：
-
-```text
-串口 UART / CAN / ROS2 topic / UDP / GPIO PWM
-```
-
-建议控制程序接收的是"预测目标点"，不是当前检测点：
-
-```text
-predicted_center = current_center + velocity * control_latency
+[CarController] → TARGET 指令 → ESP32
 ```
 
 ## 训练 YOLO
 
 见 [tools/train_yolo.md](tools/train_yolo.md)。
+
+## Wiki
+
+- [README_simulation.md](README_simulation.md) — 仿真系统说明
+- [docs/data_contracts.md](docs/data_contracts.md) — 数据结构与坐标约定
+- [environment_report.md](environment_report.md) — 环境配置报告
+- [FINAL_REPORT.md](FINAL_REPORT.md) — 集成报告

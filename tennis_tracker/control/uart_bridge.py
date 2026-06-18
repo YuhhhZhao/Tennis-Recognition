@@ -1,26 +1,45 @@
-"""Jetson ↔ ESP32 TinyBee UART 通信桥
+"""Jetson ↔ ESP32 TinyBee UART 通信桥 v3.1
 
 协议 (文本, 115200 8N1):
   Jetson → ESP32:  TARGET <x> <y> <t>\n
-  ESP32 → Jetson:  RDY\n  |  OK\n  |  DONE\n  |  ERR <msg>\n  |  PONG x=... y=...\n
+                    VEL <vx> <vy> <w>\n
+                    STOP\n
+                    PING\n         → 返回里程计 (x,y,yaw) + 步数
+                    ODOM\n         → 纯里程计查询
+                    RESET_ODOM\n   → 里程计归零
+                    STAT\n
+  ESP32 → Jetson:  RDY\n  |  OK\n  |  ERR <msg>\n
+                    PONG x=<m> y=<m> yaw=<rad> steps=<s0>,<s1>,<s2>,<s3>\n
+                    ODOM x=<m> y=<m> yaw=<rad>\n
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Optional, Tuple
 
 import time
 
 from ..config import UartConfig
 
-# pyserial 是可选依赖, 仅在需要 UART 通信时安装
 _SER_EXC = (OSError,)
 try:
     import serial as _serial_mod
     _SER_EXC = (OSError, getattr(_serial_mod, "SerialException", OSError))
 except ImportError:
     _serial_mod = None
-    pass
+
+
+@dataclass
+class StepCounts:
+    """ESP32 四轮带符号步数."""
+    s0: int = 0  # 左前
+    s1: int = 0  # 右前
+    s2: int = 0  # 左后
+    s3: int = 0  # 右后
+
+    def to_tuple(self) -> Tuple[int, int, int, int]:
+        return (self.s0, self.s1, self.s2, self.s3)
 
 
 class UartBridge:
@@ -43,7 +62,6 @@ class UartBridge:
                 timeout=self.cfg.timeout_s,
                 write_timeout=0.1,
             )
-            # 等待 ESP32 上电握手
             t0 = time.monotonic()
             while time.monotonic() - t0 < 3.0:
                 line = self._readline()
@@ -73,32 +91,57 @@ class UartBridge:
         msg = f"TARGET {x_m:.3f} {y_m:.3f} {t_arrival_s:.3f}\n"
         return self._write(msg)
 
+    def send_vel(self, vx: float, vy: float, w: float) -> bool:
+        """发送原始速度指令 (调试用)."""
+        msg = f"VEL {vx:.3f} {vy:.3f} {w:.3f}\n"
+        return self._write(msg)
+
     def send_stop(self) -> bool:
         """紧急停车."""
         return self._write("STOP\n")
 
-    def send_ping(self) -> Optional[Tuple[float, float]]:
-        """发送 PING, 返回 ESP32 报告的里程计 (x, y) 或 None."""
+    def send_ping(self) -> Optional[StepCounts]:
+        """发送 PING, 返回四轮步数."""
         if not self._write("PING\n"):
             return None
-        t0 = time.monotonic()
-        while time.monotonic() - t0 < 0.3:
-            line = self._readline()
-            if line and line.startswith("PONG"):
-                parts = line.split()
-                try:
-                    x = float(parts[1].split("=")[1])
-                    y = float(parts[2].split("=")[1])
-                    return (x, y)
-                except (IndexError, ValueError):
-                    return None
+        line = self._wait_for_prefix("PONG", timeout=0.3)
+        if line:
+            return self._parse_pong(line)
         return None
 
+    def send_reset_steps(self) -> bool:
+        """重置 ESP32 步数计数."""
+        if not self._write("RESET_STEPS\n"):
+            return False
+        line = self._wait_for_prefix("STEPS_RESET", timeout=0.3)
+        return line is not None
+
     def read_response(self) -> Optional[str]:
-        """非阻塞读取一行 ESP32 响应. 用于状态监控."""
+        """非阻塞读取一行 ESP32 响应."""
         return self._readline()
 
+    # ---- parsers ----------------------------------------------------------
+
+    @staticmethod
+    def _parse_pong(line: str) -> Optional[StepCounts]:
+        """解析 PONG s=<s0>,<s1>,<s2>,<s3>"""
+        try:
+            # "PONG s=1234,-567,890,42"
+            s = line.split("=", 1)[1]  # "1234,-567,890,42"
+            vals = [int(v) for v in s.split(",")]
+            return StepCounts(s0=vals[0], s1=vals[1], s2=vals[2], s3=vals[3])
+        except (IndexError, ValueError, AttributeError):
+            return None
+
     # ---- internals --------------------------------------------------------
+
+    def _wait_for_prefix(self, prefix: str, timeout: float) -> Optional[str]:
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            line = self._readline()
+            if line and line.startswith(prefix):
+                return line
+        return None
 
     def _write(self, data: str) -> bool:
         if not self.is_open:

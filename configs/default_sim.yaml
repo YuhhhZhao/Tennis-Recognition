@@ -1,0 +1,93 @@
+camera:
+  width: 640
+  height: 360
+  fps: 60
+  fx: 520.0
+  fy: 520.0
+  cx: 320.0
+  cy: 180.0
+  height_m: 1.20
+  pitch_deg: 0.0
+  yaw_deg: 0.0
+
+detector:
+  hsv_lower: [24, 60, 80]
+  hsv_upper: [48, 255, 255]
+  min_area: 12.0
+  max_area: 50000.0
+  min_circularity: 0.45
+  min_radius_px: 2.0
+  max_radius_px: 80.0
+  erode_iterations: 1
+  dilate_iterations: 2
+
+ball:
+  radius_m: 0.0335
+  gravity_mps2: -9.81
+  bounce_coefficient: 0.62
+
+court:
+  length_m: 12.0
+  width_m: 8.0
+  x_min: 0.0
+  x_max: 12.0
+  y_min: -4.0
+  y_max: 4.0
+
+robot:
+  start_pose: [0.0, 0.0, 0.0]
+  max_speed_mps: 4.0
+  max_angular_rate_radps: 5.0
+  max_accel_mps2: 6.0
+  wheel_base_m: 0.32
+  catch_offset_m: [0.0, 0.0]
+  position_tolerance_m: 0.15
+
+controller:
+  linear_gain: 2.4
+  angular_gain: 5.0
+  yaw_tolerance_rad: 0.08
+  timeout_s: 4.0
+
+trajectory:
+  min_samples_for_fit: 6
+  max_history: 80
+  max_landing_time_s: 3.0
+  max_clean_error_m: 0.5
+
+imu:
+  accel_noise_std: 0.04
+  gyro_noise_std: 0.01
+  accel_bias: [0.0, 0.0, 0.0]
+  gyro_bias: [0.0, 0.0, 0.0]
+  timestamp_jitter_std: 0.0
+  seed: 123
+  yaw_complementary_alpha: 0.92
+
+sim:
+  scenario: default
+  seed: 7
+  frames: 90
+  dt: 0.0166666667
+  render_noise: 0.0
+  save_overlay_video: true
+
+logging:
+  output_dir: outputs/smoke
+  trajectory_csv: trajectory.csv
+  detections_csv: detections.csv
+  tracks_csv: tracks.csv
+  robot_path_csv: robot_path.csv
+  imu_csv: imu.csv
+  commands_csv: commands.csv
+  metrics_json: metrics.json
+  top_down_png: top_down.png
+  overlay_video: overlay.mp4
+  overlay_image: overlay_last.png
+
+safety:
+  enable_real_hardware: false
+  require_hardware_flag: true
+  max_command_speed_mps: 4.0
+  max_command_omega_radps: 5.0
+  dry_run: true

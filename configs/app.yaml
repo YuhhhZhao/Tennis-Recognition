@@ -5,7 +5,7 @@ camera:
 
 yolo:
   enabled: true
-  model_path: "weights/best.pt"
+  model_path: "weights/best_v3.pt"
   class_name: "tennis ball"
   confidence: 0.35
   imgsz: 640
@@ -44,7 +44,7 @@ display:
   window_name: "tennis-ball-tracker"
 
 control:
-  enabled: false
+  enabled: true
   deadband_px: 20
   max_command: 1.0
 
@@ -69,8 +69,8 @@ trajectory:
 
 # ESP32 下位板 UART 通信
 uart:
-  enabled: false                # 连上 TinyBee 后改为 true
-  port: "/dev/ttyTHS1"         # Jetson UART1 (J12 pin 8 TX, pin 10 RX)
+  enabled: true                # 已连接 ESP32
+  port: "/dev/ttyCH341USB0"    # ESP32 CH340 USB-UART
   baudrate: 115200             # 与 ESP32 固件一致
   timeout_s: 0.05
 
