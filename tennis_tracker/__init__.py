@@ -20,6 +20,7 @@ from .prediction import (
     CameraIntrinsics,
     CameraPose,
     TrajectoryFilter,
+    camera_to_robot,
     detect_to_robot_3d,
     load_calibration,
 )
@@ -44,6 +45,7 @@ __all__ = [
     "CameraIntrinsics",
     "CameraPose",
     "TrajectoryFilter",
+    "camera_to_robot",
     "detect_to_robot_3d",
     "load_calibration",
     # control

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 import yaml
 
@@ -12,6 +12,8 @@ class CameraConfig:
     width: int
     height: int
     fps: int
+    fourcc: str = "MJPG"
+    buffer_size: int = 1
 
 
 @dataclass
@@ -38,6 +40,12 @@ class HSVConfig:
     min_mask_fill_ratio: float
     max_aspect_ratio: float
     close_iterations: int = 2
+    max_mask_fill_ratio: float = 0.95
+    min_circle_fill_ratio: float = 0.65
+    min_radius_px: float = 3.0
+    max_radius_px: float = 80.0
+    reject_border_touch: bool = True
+    border_margin_px: int = 2
 
 
 @dataclass
@@ -61,6 +69,8 @@ class FilterConfig:
 class DisplayConfig:
     enabled: bool
     window_name: str
+    trail_length: int = 40
+    show_fps: bool = True
 
 
 @dataclass
@@ -82,9 +92,12 @@ class CalibrationConfig:
 class GeometryConfig:
     calibration_path: str  # .npz 标定文件路径
     ball_diameter_m: float = 0.067
-    camera_height_m: float = 0.3  # 相机距地面高度
+    camera_height_m: float = 0.3  # 兼容旧配置: 未指定 camera_offset_z_m 时使用
     camera_pitch_deg: float = 20.0  # 俯仰角 (正值=向下)
     camera_yaw_deg: float = 0.0  # 偏航角
+    camera_offset_x_m: float = 0.0  # 相机光心相对机器人原点 X 偏移
+    camera_offset_y_m: float = 0.0  # 相机光心相对机器人原点 Y 偏移
+    camera_offset_z_m: Optional[float] = None  # None 时回退到 camera_height_m
 
 
 @dataclass
@@ -104,6 +117,7 @@ class UartConfig:
     port: str = "/dev/ttyTHS1"  # Jetson UART1
     baudrate: int = 115200
     timeout_s: float = 0.05
+    handshake_timeout_s: float = 3.0
     enabled: bool = False
 
 

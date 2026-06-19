@@ -52,17 +52,27 @@ class CameraPose:
     Attributes
     ----------
     height_m : float
-        相机光心距地面高度 (米), 沿机器人 Z 轴向上为正.
+        兼容旧配置: 未指定 offset_z_m 时, 作为相机光心 Z 平移量.
     pitch_deg : float
         俯仰角 (度). 正值 = 相机向下倾斜 (光轴指向地面).
         0° = 光轴水平, 90° = 垂直向下.
     yaw_deg : float
         偏航角 (度). 正值 = 顺时针 (从上方看). 0° = 机器人正前方.
+    offset_x_m : float
+        相机光心相对机器人原点的 X 偏移 (米), 机器人前方为正.
+    offset_y_m : float
+        相机光心相对机器人原点的 Y 偏移 (米), 机器人左方为正.
+    offset_z_m : Optional[float]
+        相机光心相对机器人原点的 Z 偏移 (米), 机器人上方为正.
+        None 时使用 height_m 保持旧配置行为.
     """
 
     height_m: float = 0.3
     pitch_deg: float = 20.0
     yaw_deg: float = 0.0
+    offset_x_m: float = 0.0
+    offset_y_m: float = 0.0
+    offset_z_m: Optional[float] = None
 
     @property
     def pitch_rad(self) -> float:
@@ -71,6 +81,14 @@ class CameraPose:
     @property
     def yaw_rad(self) -> float:
         return np.deg2rad(self.yaw_deg)
+
+    @property
+    def translation_m(self) -> np.ndarray:
+        z_m = self.height_m if self.offset_z_m is None else self.offset_z_m
+        return np.array(
+            [self.offset_x_m, self.offset_y_m, z_m],
+            dtype=np.float64,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -180,8 +198,7 @@ def camera_to_robot(
     """
     R = _build_transform_matrix(pose)
     cam = np.array([Xc, Yc, Zc], dtype=np.float64)
-    robot = R @ cam
-    robot[2] += pose.height_m  # 相机高度补偿
+    robot = R @ cam + pose.translation_m
     return (float(robot[0]), float(robot[1]), float(robot[2]))
 
 

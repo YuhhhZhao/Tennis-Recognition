@@ -34,6 +34,7 @@ from tennis_tracker.prediction import (
     CameraIntrinsics,
     CameraPose,
     TrajectoryFilter,
+    camera_to_robot,
     depth_from_ball_radius,
     detect_to_robot_3d,
     pixel_to_camera_frame,
@@ -153,6 +154,19 @@ def test_camera_to_robot():
         check(f"center ball Zr ~ H={CAMERA_HEIGHT}m", abs(z - CAMERA_HEIGHT) < 0.02,
               f"z={z:.3f}")
         print(f"      球在中心: ({x:.2f}, {y:.2f}, {z:.2f}) m  (同相机高度)")
+
+    offset_pose = CameraPose(
+        height_m=CAMERA_HEIGHT,
+        pitch_deg=0.0,
+        yaw_deg=0.0,
+        offset_x_m=-0.08,
+        offset_y_m=0.10,
+        offset_z_m=0.08,
+    )
+    ox, oy, oz = camera_to_robot(0.0, 0.0, 1.0, offset_pose)
+    check("offset X applied", abs(ox - 0.92) < 1e-6, f"x={ox:.3f}")
+    check("offset Y applied", abs(oy - 0.10) < 1e-6, f"y={oy:.3f}")
+    check("offset Z overrides height", abs(oz - 0.08) < 1e-6, f"z={oz:.3f}")
 
     # --- 情况 B: 球在地面 ---
     # 水平相机看地面: 球在图像下半部, Yc > 0

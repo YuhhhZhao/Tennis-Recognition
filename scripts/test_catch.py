@@ -67,6 +67,9 @@ def main():
         height_m=cfg.geometry.camera_height_m,
         pitch_deg=cfg.geometry.camera_pitch_deg,
         yaw_deg=cfg.geometry.camera_yaw_deg,
+        offset_x_m=cfg.geometry.camera_offset_x_m,
+        offset_y_m=cfg.geometry.camera_offset_y_m,
+        offset_z_m=cfg.geometry.camera_offset_z_m,
     )
 
     # 轨迹预测

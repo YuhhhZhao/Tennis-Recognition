@@ -1,0 +1,821 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import sys
+import threading
+import time
+from collections import deque
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from typing import Any, Deque, Optional
+
+import cv2
+
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from tennis_tracker.config import UartConfig, load_config
+from tennis_tracker.control.uart_bridge import UartBridge
+from tennis_tracker.detection import AlphaBetaFilter, YOLODetector, clamp_point
+from tennis_tracker.prediction import (
+    BallisticSolver,
+    CameraPose,
+    TrajectoryFilter,
+    detect_to_robot_3d,
+    load_calibration,
+)
+from tennis_tracker.state import Detection, Detection3D, LandingPoint, TrackState
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "YOLO-only catch integration: detect a 3D speed jump, predict landing, "
+            "and optionally send TARGET to ESP32."
+        )
+    )
+    parser.add_argument("--config", default="configs/app.yaml")
+    parser.add_argument("--source", default="0")
+    parser.add_argument("--model", default="weights/best_v3.pt")
+    parser.add_argument("--conf", type=float, default=0.25)
+    parser.add_argument("--imgsz", type=int, default=640)
+    parser.add_argument("--device", default="0")
+    parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--http-stream", action="store_true",
+                        help="Serve MJPEG HTTP stream at --http-stream-port (no X11 needed).")
+    parser.add_argument("--http-stream-port", type=int, default=8080,
+                        help="Port for MJPEG HTTP stream.")
+    parser.add_argument("--enable-control", action="store_true", help="Actually send TARGET to ESP32.")
+    parser.add_argument("--uart-port", default=None)
+    parser.add_argument("--baudrate", type=int, default=None)
+    parser.add_argument("--uart-handshake-timeout", type=float, default=0.5, help="Seconds to wait for ESP32 RDY after opening UART.")
+    parser.add_argument("--trigger-speed", type=float, default=0.6, help="Current 3D speed threshold, m/s.")
+    parser.add_argument("--trigger-delta", type=float, default=0.35, help="Speed jump threshold, m/s.")
+    parser.add_argument("--trigger-window", type=int, default=8, help="Recent 3D samples used for speed-jump trigger.")
+    parser.add_argument("--min-samples", type=int, default=4, help="Trajectory samples before landing prediction.")
+    parser.add_argument("--seed-samples", type=int, default=4, help="Samples to seed trajectory after trigger.")
+    parser.add_argument("--measurement-noise", type=float, default=0.08)
+    parser.add_argument("--process-noise-vel", type=float, default=1.2)
+    parser.add_argument("--target-height", type=float, default=None)
+    parser.add_argument("--send-interval", type=float, default=0.12)
+    parser.add_argument("--max-target-distance", type=float, default=4.0)
+    parser.add_argument("--min-arrival-time", type=float, default=0.08)
+    parser.add_argument("--active-max-missing", type=int, default=8, help="Active-mode frames without usable 3D before STOP and re-arm.")
+    parser.add_argument("--rearm-grace", type=float, default=0.25, help="Seconds after predicted landing arrival before STOP and re-arm.")
+    parser.add_argument("--rearm-cooldown", type=float, default=0.8, help="Seconds to ignore new triggers after STOP/re-arm.")
+    parser.add_argument("--print-interval", type=float, default=0.10)
+    parser.add_argument("--trail", type=int, default=60)
+    parser.add_argument("--raw-3d", action="store_true", help="Use raw YOLO box for 3D instead of filtered 2D.")
+
+    # ── Phase 1: 3D outlier filtering ──
+    parser.add_argument("--min-z", type=float, default=-0.05,
+                        help="Minimum valid Z in robot frame (m).")
+    parser.add_argument("--max-x", type=float, default=2.5,
+                        help="Maximum valid abs(X) in robot frame (m).")
+    parser.add_argument("--max-y", type=float, default=1.2,
+                        help="Maximum valid abs(Y) in robot frame (m).")
+    parser.add_argument("--max-3d-speed", type=float, default=30.0,
+                        help="Maximum physically plausible inter-frame 3D speed (m/s).")
+    parser.add_argument("--radius-median-window", type=int, default=3,
+                        help="Window size for radius median filter.")
+
+    # ── Phase 2: trigger confirmation ──
+    parser.add_argument("--trigger-confirm-frames", type=int, default=2,
+                        help="Consecutive frames meeting trigger condition required to activate.")
+    parser.add_argument("--speed-ema-alpha", type=float, default=0.3,
+                        help="EMA alpha for speed smoothing in trigger detection.")
+
+    # ── Phase 4: reachability ──
+    parser.add_argument("--reachable-max-speed", type=float, default=1.5,
+                        help="Maximum robot speed (m/s) for reachability check.")
+
+    # ── Phase 5: latency ──
+    parser.add_argument("--yolo-every-n", type=int, default=1,
+                        help="Run YOLO detection every N frames (1=every frame).")
+
+    return parser.parse_args()
+
+
+def parse_source(source: str):
+    return int(source) if source.isdigit() else str(Path(source))
+
+
+def resolve_project_path(path: str) -> Path:
+    candidate = Path(path)
+    return candidate if candidate.is_absolute() else PROJECT_ROOT / candidate
+
+
+def parse_device(value: str):
+    if value == "auto":
+        try:
+            import torch
+
+            return 0 if torch.cuda.is_available() else "cpu"
+        except Exception:
+            return "cpu"
+    return int(value) if value.isdigit() else value
+
+
+def open_capture(source, cfg):
+    if isinstance(source, int):
+        cap = cv2.VideoCapture(source, cv2.CAP_V4L2)
+        fourcc = cfg.camera.fourcc.strip().upper()
+        if fourcc:
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc[:4]))
+    else:
+        cap = cv2.VideoCapture(source)
+
+    if cfg.camera.buffer_size > 0:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, cfg.camera.buffer_size)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.camera.width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.camera.height)
+    cap.set(cv2.CAP_PROP_FPS, cfg.camera.fps)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open camera/video source: {source}")
+
+    actual_fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
+    fourcc_text = "".join(chr((actual_fourcc >> (8 * i)) & 0xFF) for i in range(4))
+    print(
+        "[CAM] "
+        f"{cap.get(cv2.CAP_PROP_FRAME_WIDTH):.0f}x"
+        f"{cap.get(cv2.CAP_PROP_FRAME_HEIGHT):.0f} @ "
+        f"{cap.get(cv2.CAP_PROP_FPS):.1f}fps fourcc={fourcc_text}",
+        flush=True,
+    )
+    return cap
+
+
+def tracked_detection_from_state(detection: Detection, state: TrackState) -> Detection:
+    return Detection(
+        center=state.center if state.center is not None else detection.center,
+        bbox=detection.bbox,
+        confidence=detection.confidence,
+        source="YOLO_TRACK",
+        timestamp=detection.timestamp,
+        radius=state.radius if state.radius > 0 else detection.radius,
+    )
+
+
+def detection_to_3d(detection: Detection, cfg, calib, camera_pose: CameraPose):
+    if calib is None:
+        return None
+    u, v = detection.center
+    return detect_to_robot_3d(
+        u,
+        v,
+        detection.radius,
+        calib,
+        camera_pose,
+        real_diameter_m=cfg.geometry.ball_diameter_m,
+    )
+
+
+def speed_stats(
+    samples: Deque[Detection3D],
+    ema_alpha: float = 0.3,
+) -> tuple[float, float, float]:
+    """Compute speed statistics with EMA smoothing for noise reduction.
+
+    Returns (baseline_speed, current_speed, speed_delta).
+    baseline_speed: average of first half of EMA-smoothed speeds
+    current_speed: average of second half of EMA-smoothed speeds
+    speed_delta: current_speed - baseline_speed
+    """
+    if len(samples) < 4:
+        return 0.0, 0.0, 0.0
+
+    # Compute raw inter-sample speeds
+    speeds: list = []
+    items = list(samples)
+    for prev, cur in zip(items, items[1:]):
+        dt = cur.timestamp - prev.timestamp
+        if dt <= 1e-6:
+            continue
+        dx = cur.pos[0] - prev.pos[0]
+        dy = cur.pos[1] - prev.pos[1]
+        dz = cur.pos[2] - prev.pos[2]
+        speeds.append(math.sqrt(dx * dx + dy * dy + dz * dz) / dt)
+
+    if len(speeds) < 3:
+        return 0.0, 0.0, 0.0
+
+    # EMA smooth the speeds to suppress single-frame noise spikes
+    smoothed = [speeds[0]]
+    for s in speeds[1:]:
+        smoothed.append(ema_alpha * s + (1.0 - ema_alpha) * smoothed[-1])
+
+    split = max(1, len(smoothed) // 2)
+    baseline = sum(smoothed[:split]) / len(smoothed[:split])
+    current = sum(smoothed[split:]) / len(smoothed[split:])
+
+    return baseline, current, current - baseline
+
+
+def update_trajectory(
+    det_3d: Detection3D,
+    traj_filter: TrajectoryFilter,
+    ballistic: BallisticSolver,
+    state: TrackState,
+    max_history: int,
+) -> Optional[LandingPoint]:
+    state.pos_3d = det_3d.pos
+    state.last_radius_px = det_3d.radius_px
+    state.history_3d.append(det_3d)
+    if len(state.history_3d) > max_history:
+        state.history_3d = state.history_3d[-max_history:]
+    traj_filter.update(det_3d)
+    vx, vy, vz = traj_filter.velocity
+    state.vel_3d = (float(vx), float(vy), float(vz))
+    return ballistic.solve(traj_filter)
+
+
+def is_safe_landing(lp: LandingPoint, args: argparse.Namespace) -> bool:
+    x, y, _ = lp.pos
+    dist = math.hypot(x, y)
+    return dist <= args.max_target_distance and lp.t_arrival >= args.min_arrival_time
+
+
+# ── Phase 1: 3D outlier filtering ──────────────────────────────────────
+
+def is_valid_3d_position(
+    pos: tuple,
+    prev_pos: Optional[tuple],
+    dt: float,
+    args: argparse.Namespace,
+) -> bool:
+    """Reject physically impossible 3D positions.
+
+    Checks:
+      1. z >= min_z (ball cannot be significantly below ground)
+      2. abs(x) <= max_x (ball within reasonable forward range)
+      3. abs(y) <= max_y (ball within reasonable lateral range)
+      4. Inter-frame speed < max_3d_speed (no teleportation)
+    """
+    x, y, z = pos
+    if z < args.min_z:
+        return False
+    if abs(x) > args.max_x:
+        return False
+    if abs(y) > args.max_y:
+        return False
+    if prev_pos is not None and dt > 1e-6:
+        px, py, pz = prev_pos
+        dist = math.sqrt((x - px) ** 2 + (y - py) ** 2 + (z - pz) ** 2)
+        speed = dist / dt
+        if speed > args.max_3d_speed:
+            return False
+    return True
+
+
+def median_radius(new_radius: float, window: Deque[float]) -> float:
+    """Maintain a sliding window of raw radii, return the median value."""
+    window.append(new_radius)
+    n = len(window)
+    if n == 0:
+        return new_radius
+    sorted_vals = sorted(window)
+    if n % 2 == 1:
+        return sorted_vals[n // 2]
+    return 0.5 * (sorted_vals[n // 2 - 1] + sorted_vals[n // 2])
+
+
+# ── Phase 4: reachability check ────────────────────────────────────────
+
+def is_reachable(lp: LandingPoint, max_robot_speed: float = 1.5) -> bool:
+    """Check if landing point is reachable given robot max speed.
+
+    Estimates required speed as Euclidean distance / t_arrival.
+    Adds 15% margin for acceleration/deceleration.
+    """
+    x, y, _ = lp.pos
+    dist = math.hypot(x, y)
+    if dist <= 0.02:  # effectively at target, no movement needed
+        return True
+    required_speed = dist / max(0.05, lp.t_arrival)
+    return required_speed <= max_robot_speed * 0.85
+
+
+# ── Phase 5: latency helpers ───────────────────────────────────────────
+
+def grab_latest_frame(cap) -> tuple:
+    """Drain V4L2 buffer queue, return the most recent frame.
+
+    Calls cap.grab() until no more frames are pending, then
+    cap.retrieve() to get the last grabbed frame. This ensures
+    we always process the newest available frame, not a stale one.
+    """
+    max_drain = 8  # safety limit to prevent infinite loop
+    for _ in range(max_drain):
+        if not cap.grab():
+            break
+    return cap.retrieve()
+
+
+# ── HTTP MJPEG stream server ──────────────────────────────────────────
+
+_shared_frame: Any = None
+_shared_frame_lock = threading.Lock()
+
+
+def _make_mjpeg_handler() -> type:
+    """Create a handler class with access to the shared frame."""
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            if self.path != "/":
+                self.send_response(404)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header(
+                "Content-Type", "multipart/x-mixed-replace; boundary=frame"
+            )
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            while True:
+                with _shared_frame_lock:
+                    if _shared_frame is None:
+                        time.sleep(0.01)
+                        continue
+                    _, jpeg = cv2.imencode(".jpg", _shared_frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                try:
+                    self.wfile.write(b"--frame\r\n")
+                    self.wfile.write(b"Content-Type: image/jpeg\r\n\r\n")
+                    self.wfile.write(jpeg.tobytes())
+                    self.wfile.write(b"\r\n")
+                except (BrokenPipeError, ConnectionResetError):
+                    break
+                time.sleep(0.03)
+
+        def log_message(self, *args) -> None:
+            pass  # suppress HTTP request logs
+
+    return _Handler
+
+
+def start_mjpeg_server(port: int) -> HTTPServer:
+    handler = _make_mjpeg_handler()
+    server = HTTPServer(("0.0.0.0", port), handler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return server
+
+
+def draw_overlay(
+    frame,
+    detection: Optional[Detection],
+    state: TrackState,
+    landing: Optional[LandingPoint],
+    trail: Deque[tuple[int, int]],
+    active: bool,
+    fps: float,
+    infer_ms: float,
+) -> None:
+    h, w = frame.shape[:2]
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (w, 130), (0, 0, 0), -1)
+    frame[:] = cv2.addWeighted(frame, 0.6, overlay, 0.4, 0)
+
+    if detection is not None:
+        x1, y1, x2, y2 = detection.bbox
+        cx, cy = clamp_point(detection.center, w, h)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
+        cv2.circle(frame, (cx, cy), max(3, int(detection.radius)), (0, 255, 0), 2)
+        cv2.circle(frame, (cx, cy), 3, (0, 0, 255), -1)
+
+    if len(trail) >= 2:
+        for p1, p2 in zip(trail, list(trail)[1:]):
+            cv2.line(frame, p1, p2, (255, 0, 255), 2)
+
+    status = "ACTIVE: sending landing" if active else "ARMED: waiting speed jump"
+    lines = [
+        status,
+        f"conf={0.0 if detection is None else detection.confidence:.2f} "
+        f"samples={len(state.history_3d)} miss={state.missing_frames}",
+        f"FPS={fps:.1f} infer={infer_ms:.1f}ms",
+    ]
+    if state.pos_3d is not None:
+        x, y, z = state.pos_3d
+        vx, vy, vz = state.vel_3d
+        lines.append(f"3D=({x:.2f},{y:.2f},{z:.2f}) v=({vx:.2f},{vy:.2f},{vz:.2f})")
+    if landing is not None:
+        lx, ly, lz = landing.pos
+        lines.append(f"Land=({lx:.2f},{ly:.2f},{lz:.2f}) t={landing.t_arrival:.2f}s")
+
+    for i, text in enumerate(lines[:5]):
+        color = (0, 255, 0) if active and i == 0 else (0, 255, 255)
+        cv2.putText(frame, text, (12, 26 + i * 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+
+
+def main() -> None:
+    args = parse_args()
+    args.active_max_missing = max(0, args.active_max_missing)
+    args.rearm_grace = max(0.0, args.rearm_grace)
+    args.rearm_cooldown = max(0.0, args.rearm_cooldown)
+    args.uart_handshake_timeout = max(0.0, args.uart_handshake_timeout)
+    cfg = load_config(resolve_project_path(args.config))
+    cfg.yolo.enabled = True
+    cfg.yolo.model_path = str(resolve_project_path(args.model))
+    cfg.yolo.confidence = args.conf
+    cfg.yolo.imgsz = args.imgsz
+    cfg.yolo.device = parse_device(args.device)
+    cfg.display.enabled = not args.headless
+    cfg.display.trail_length = args.trail
+    cfg.trajectory.min_samples_for_fit = max(2, args.min_samples)
+    cfg.trajectory.measurement_noise = max(1e-6, args.measurement_noise)
+    cfg.trajectory.process_noise_vel = max(1e-6, args.process_noise_vel)
+    if args.target_height is not None:
+        cfg.trajectory.target_height_m = args.target_height
+
+    print(
+        "[MODE] YOLO-only catch control "
+        f"control={'ENABLED' if args.enable_control else 'DRY-RUN'}",
+        flush=True,
+    )
+    print(
+        f"[TRIGGER] speed>={args.trigger_speed:.2f}m/s "
+        f"delta>={args.trigger_delta:.2f}m/s window={args.trigger_window}",
+        flush=True,
+    )
+    print(
+        f"[PRED] min_samples={cfg.trajectory.min_samples_for_fit} "
+        f"measurement_noise={cfg.trajectory.measurement_noise} "
+        f"process_noise_vel={cfg.trajectory.process_noise_vel}",
+        flush=True,
+    )
+    print(
+        f"[SAFE] active_max_missing={args.active_max_missing} "
+        f"rearm_grace={args.rearm_grace:.2f}s "
+        f"rearm_cooldown={args.rearm_cooldown:.2f}s",
+        flush=True,
+    )
+
+    uart: Optional[UartBridge] = None
+    if args.enable_control:
+        port = args.uart_port or cfg.uart.port
+        baudrate = args.baudrate or cfg.uart.baudrate
+        uart = UartBridge(
+            UartConfig(
+                port=port,
+                baudrate=baudrate,
+                timeout_s=cfg.uart.timeout_s,
+                handshake_timeout_s=args.uart_handshake_timeout,
+                enabled=True,
+            )
+        )
+        if not uart.open():
+            raise RuntimeError(f"Cannot open ESP32 UART: {port}")
+        uart.send_stop()
+        print(f"[UART] control armed on {port} @ {baudrate}", flush=True)
+    else:
+        print("[UART] dry-run: no TARGET will be sent. Add --enable-control to move car.", flush=True)
+
+    # ── HTTP MJPEG stream ──
+    http_server: Optional[HTTPServer] = None
+    if args.http_stream:
+        http_server = start_mjpeg_server(args.http_stream_port)
+        # Use HTTP stream instead of local imshow
+        cfg.display.enabled = False
+        print(
+            f"[STREAM] MJPEG http://{os.uname().nodename}:{args.http_stream_port}/  "
+            f"(or http://<jetson-ip>:{args.http_stream_port}/)",
+            flush=True,
+        )
+
+    detector = YOLODetector(cfg.yolo)
+    detector.load()
+    cap = open_capture(parse_source(args.source), cfg)
+
+    calib = load_calibration(resolve_project_path(cfg.geometry.calibration_path))
+    if calib is None:
+        raise RuntimeError(f"Calibration not loaded: {cfg.geometry.calibration_path}")
+    camera_pose = CameraPose(
+        height_m=cfg.geometry.camera_height_m,
+        pitch_deg=cfg.geometry.camera_pitch_deg,
+        yaw_deg=cfg.geometry.camera_yaw_deg,
+        offset_x_m=cfg.geometry.camera_offset_x_m,
+        offset_y_m=cfg.geometry.camera_offset_y_m,
+        offset_z_m=cfg.geometry.camera_offset_z_m,
+    )
+
+    filter_2d = AlphaBetaFilter(cfg.filter.alpha, cfg.filter.beta)
+    traj_filter = TrajectoryFilter(cfg.trajectory)
+    ballistic = BallisticSolver(cfg.trajectory)
+    state = TrackState()
+    trigger_samples: Deque[Detection3D] = deque(maxlen=max(4, args.trigger_window))
+    trail: Deque[tuple[int, int]] = deque(maxlen=max(0, args.trail))
+
+    active = False
+    landing: Optional[LandingPoint] = None
+    landing_count = 0
+    last_send_t = 0.0
+    last_print_t = 0.0
+    last_frame_t = 0.0
+    missing_after_active = 0
+    landing_deadline_t: Optional[float] = None
+    rearm_until_t = 0.0
+    fps = 0.0
+
+    # Phase 1: outlier filtering state
+    radius_window: Deque[float] = deque(maxlen=max(3, args.radius_median_window))
+    last_valid_3d_pos: Optional[tuple] = None
+    last_valid_3d_t: float = 0.0
+
+    # Phase 2: trigger confirmation
+    trigger_confirm_count: int = 0
+
+    # Phase 5: YOLO frame skip
+    yolo_frame_counter: int = 0
+
+    # Track consecutive "landing too soon" to avoid premature rearm
+    landing_too_soon_streak: int = 0
+
+    def rearm(reason: str) -> None:
+        nonlocal active
+        nonlocal landing
+        nonlocal landing_count
+        nonlocal last_send_t
+        nonlocal last_print_t
+        nonlocal missing_after_active
+        nonlocal landing_deadline_t
+        nonlocal rearm_until_t
+        nonlocal trigger_confirm_count
+        nonlocal yolo_frame_counter
+        nonlocal landing_too_soon_streak
+
+        stopped = False
+        if uart is not None:
+            stopped = uart.send_stop()
+
+        active = False
+        landing = None
+        landing_count = 0
+        last_send_t = 0.0
+        last_print_t = 0.0
+        missing_after_active = 0
+        landing_deadline_t = None
+        rearm_until_t = time.monotonic() + args.rearm_cooldown
+        trigger_confirm_count = 0
+        yolo_frame_counter = 0
+        landing_too_soon_streak = 0
+        traj_filter.reset()
+        state.reset()
+        trigger_samples.clear()
+        trail.clear()
+        radius_window.clear()
+        nonlocal last_valid_3d_pos
+        nonlocal last_valid_3d_t
+        last_valid_3d_pos = None
+        last_valid_3d_t = 0.0
+
+        stop_status = "STOP sent" if stopped else "STOP dry-run" if uart is None else "STOP failed"
+        print(f"\n[SAFE] {reason}; {stop_status}; re-armed", flush=True)
+
+    try:
+        while True:
+            # ── Phase 5a: grab latest frame (drain stale buffers) ──
+            ok, frame = grab_latest_frame(cap)
+            if not ok:
+                break
+            now_t = time.monotonic()
+            if last_frame_t > 0:
+                instant = 1.0 / max(1e-6, now_t - last_frame_t)
+                fps = instant if fps <= 0 else 0.85 * fps + 0.15 * instant
+            last_frame_t = now_t
+
+            got_usable_3d = False
+            in_rearm_cooldown = now_t < rearm_until_t
+            infer_ms = 0.0  # default when YOLO is skipped
+
+            # ── Phase 5b: optional YOLO frame skip ──
+            yolo_frame_counter += 1
+            run_yolo = yolo_frame_counter >= args.yolo_every_n
+
+            detection = None
+            if run_yolo:
+                t0 = time.monotonic()
+                detection = detector.detect(frame)
+                infer_ms = (time.monotonic() - t0) * 1000.0
+                yolo_frame_counter = 0
+            # else: frame skipped, detection stays None, infer_ms=0.0
+
+            if in_rearm_cooldown:
+                if now_t - last_print_t >= args.print_interval:
+                    print(
+                        f"[COOLDOWN] ignoring trigger for {rearm_until_t - now_t:.2f}s",
+                        flush=True,
+                    )
+                    last_print_t = now_t
+            elif detection is not None:
+                state = filter_2d.update(state, detection)
+                trail.append(clamp_point(state.center, frame.shape[1], frame.shape[0]))
+                det_for_3d = detection if args.raw_3d else tracked_detection_from_state(detection, state)
+
+                # ── Phase 1: median radius filter + 3D outlier check ──
+                median_r = median_radius(det_for_3d.radius, radius_window)
+                pos_raw = detection_to_3d(det_for_3d, cfg, calib, camera_pose)
+                if pos_raw is not None and median_r > 0:
+                    # Recompute 3D with median-smoothed radius for stability
+                    u, v = det_for_3d.center
+                    pos = detect_to_robot_3d(
+                        u, v, median_r, calib, camera_pose,
+                        real_diameter_m=cfg.geometry.ball_diameter_m,
+                    )
+                    # Fall back to raw position if median-recomputed fails
+                    if pos is None:
+                        pos = pos_raw
+                else:
+                    pos = pos_raw
+
+                if pos is not None:
+                    # Phase 1: outlier rejection
+                    dt_3d = (det_for_3d.timestamp - last_valid_3d_t) if last_valid_3d_pos is not None else 0.0
+                    if is_valid_3d_position(pos, last_valid_3d_pos, dt_3d, args):
+                        got_usable_3d = True
+                        last_valid_3d_pos = pos
+                        last_valid_3d_t = det_for_3d.timestamp
+
+                        det_3d = Detection3D(
+                            pos=pos,
+                            confidence=det_for_3d.confidence,
+                            timestamp=det_for_3d.timestamp,
+                            radius_px=median_r,
+                        )
+                        trigger_samples.append(det_3d)
+
+                        # ── Phase 2a: EMA-smoothed speed stats ──
+                        prev_speed, current_speed, speed_delta = speed_stats(
+                            trigger_samples, ema_alpha=args.speed_ema_alpha,
+                        )
+
+                        if not active:
+                            # ── Phase 2b: trigger with confirmation counter ──
+                            condition_met = (
+                                len(trigger_samples) >= max(4, args.trigger_window // 2)
+                                and current_speed >= args.trigger_speed
+                                and speed_delta >= args.trigger_delta
+                            )
+                            if condition_met:
+                                trigger_confirm_count += 1
+                            else:
+                                trigger_confirm_count = max(0, trigger_confirm_count - 1)
+
+                            if trigger_confirm_count >= args.trigger_confirm_frames:
+                                active = True
+                                missing_after_active = 0
+                                landing_deadline_t = None
+                                landing_count = 0
+                                last_send_t = 0.0
+                                traj_filter.reset()
+                                state.history_3d.clear()
+                                seed = list(trigger_samples)[-max(2, args.seed_samples):]
+                                trigger_rejected = False
+                                for sample in seed:
+                                    landing = update_trajectory(
+                                        sample, traj_filter, ballistic, state, cfg.trajectory.max_history
+                                    )
+                                # ── Phase 3: bootstrap Kalman velocity from seed samples ──
+                                if len(seed) >= 2:
+                                    dt_seed = seed[1].timestamp - seed[0].timestamp
+                                    if dt_seed > 1e-6:
+                                        traj_filter._x[3, 0] = (seed[1].pos[0] - seed[0].pos[0]) / dt_seed
+                                        traj_filter._x[4, 0] = (seed[1].pos[1] - seed[0].pos[1]) / dt_seed
+                                        traj_filter._x[5, 0] = (seed[1].pos[2] - seed[0].pos[2]) / dt_seed
+                                if landing is not None:
+                                    landing_deadline_t = now_t + landing.t_arrival
+                                    if landing.t_arrival < args.min_arrival_time:
+                                        trigger_rejected = True
+                                        rearm(f"landing too soon t={landing.t_arrival:.2f}s")
+                                if not trigger_rejected:
+                                    print(
+                                        "\n[TRIGGER] speed jump confirmed "
+                                        f"prev={prev_speed:.2f} current={current_speed:.2f} "
+                                        f"delta={speed_delta:.2f}m/s seed={len(seed)} "
+                                        f"confirm={trigger_confirm_count}",
+                                        flush=True,
+                                    )
+                        else:
+                            landing = update_trajectory(
+                                det_3d, traj_filter, ballistic, state, cfg.trajectory.max_history
+                            )
+                            if landing is not None:
+                                estimated_arrival_t = now_t + landing.t_arrival
+                                landing_deadline_t = estimated_arrival_t
+                                if landing.t_arrival < args.min_arrival_time:
+                                    # Don't rearm immediately — Kalman may still be converging.
+                                    # Only rearm if too-short persists for many consecutive frames.
+                                    landing_too_soon_streak += 1
+                                else:
+                                    landing_too_soon_streak = 0
+                            else:
+                                # No prediction yet (e.g. Kalman not ready) — not a failure
+                                pass
+
+                        if not active and now_t - last_print_t >= args.print_interval:
+                            x, y, z = pos
+                            print(
+                                f"[WAIT] pos=({x:+.2f},{y:+.2f},{z:+.2f}) "
+                                f"speed={current_speed:.2f} delta={speed_delta:.2f} "
+                                f"confirm={trigger_confirm_count}/{args.trigger_confirm_frames}",
+                                flush=True,
+                            )
+                            last_print_t = now_t
+                    # else: outlier rejected, skip this 3D point
+            else:
+                if detection is None:
+                    state.mark_missing()
+
+            if active:
+                if got_usable_3d:
+                    missing_after_active = 0
+                else:
+                    missing_after_active += 1
+                    if missing_after_active > args.active_max_missing:
+                        rearm(f"lost ball for {missing_after_active} active frames")
+
+                # ── Persistent "landing too soon" check ──
+                # Only rearm if t_arrival stays too short for many consecutive frames,
+                # giving the Kalman filter time to converge.
+                if landing_too_soon_streak > 5:
+                    rearm(f"persistent landing too soon ({landing_too_soon_streak} frames)")
+
+            if active and landing is not None and now_t - last_print_t >= args.print_interval:
+                landing_count += 1
+                lx, ly, lz = landing.pos
+                vx, vy, vz = traj_filter.velocity
+
+                # Determine status: check if this landing is too soon (late)
+                landing_is_late = landing.t_arrival < args.min_arrival_time
+
+                # ── Phase 4: reachability check ──
+                safe = is_safe_landing(landing, args) and not landing_is_late
+                reachable = is_reachable(landing, max_robot_speed=args.reachable_max_speed) if safe else False
+                should_send = safe and reachable
+
+                sent = False
+                if should_send and uart is not None and now_t - last_send_t >= args.send_interval:
+                    sent = uart.send_target(lx, ly, landing.t_arrival)
+                    last_send_t = now_t
+                    # ── Phase 5c: decouple UART read (every 4th send) ──
+                    if landing_count % 4 == 0:
+                        resp = uart.read_response()
+                        if resp:
+                            print(f"[UART] {resp}", flush=True)
+
+                if landing_is_late:
+                    status = f"late(streak={landing_too_soon_streak})"
+                elif safe and not reachable:
+                    status = "unreachable"
+                elif safe:
+                    status = "safe"
+                else:
+                    status = "unsafe"
+                print(
+                    f"[LAND#{landing_count:04d}] "
+                    f"pos=({lx:+.2f},{ly:+.2f},{lz:+.2f}) "
+                    f"t={landing.t_arrival:.2f}s conf={landing.confidence:.2f} "
+                    f"vel=({vx:+.2f},{vy:+.2f},{vz:+.2f}) "
+                    f"{'SENT' if sent else 'DRY' if uart is None else 'HELD'} "
+                    f"{status}",
+                    flush=True,
+                )
+                last_print_t = now_t
+
+            if active and landing_deadline_t is not None and now_t >= landing_deadline_t + args.rearm_grace:
+                rearm("predicted landing window passed")
+
+            if cfg.display.enabled:
+                draw_overlay(frame, detection, state, landing, trail, active, fps, infer_ms)
+                cv2.imshow(cfg.display.window_name, frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+
+            # ── Share frame to HTTP MJPEG stream ──
+            if http_server is not None:
+                overlay_frame = frame.copy()
+                draw_overlay(overlay_frame, detection, state, landing, trail, active, fps, infer_ms)
+                with _shared_frame_lock:
+                    global _shared_frame
+                    _shared_frame = overlay_frame
+
+    finally:
+        cap.release()
+        if uart is not None:
+            for _ in range(3):
+                uart.send_stop()
+                time.sleep(0.03)
+            uart.close()
+        if http_server is not None:
+            http_server.shutdown()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import time
+from collections import deque
 from pathlib import Path
+from typing import Deque
 from typing import Optional
 
 import cv2
@@ -52,6 +54,11 @@ class TrackerPipeline:
         if cfg.yolo.enabled:
             self.yolo_worker = AsyncYOLOWorker(YOLODetector(cfg.yolo))
         self.last_yolo_request = 0.0
+        self.trail: Deque[tuple[int, int]] = deque(
+            maxlen=max(0, cfg.display.trail_length)
+        )
+        self._last_frame_time = 0.0
+        self._display_fps = 0.0
         self.controller = CarController(
             cfg.control,
             frame_width=cfg.camera.width,
@@ -66,6 +73,9 @@ class TrackerPipeline:
             height_m=cfg.geometry.camera_height_m,
             pitch_deg=cfg.geometry.camera_pitch_deg,
             yaw_deg=cfg.geometry.camera_yaw_deg,
+            offset_x_m=cfg.geometry.camera_offset_x_m,
+            offset_y_m=cfg.geometry.camera_offset_y_m,
+            offset_z_m=cfg.geometry.camera_offset_z_m,
         )
         self.traj_filter = TrajectoryFilter(cfg.trajectory)
         self.ballistic = BallisticSolver(cfg.trajectory)
@@ -88,10 +98,7 @@ class TrackerPipeline:
             # IMU 延迟到 run() 中连接, 避免阻塞导入
 
     def run(self) -> None:
-        cap = cv2.VideoCapture(self.source)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.cfg.camera.width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.cfg.camera.height)
-        cap.set(cv2.CAP_PROP_FPS, self.cfg.camera.fps)
+        cap = self._open_capture()
 
         if not cap.isOpened():
             raise RuntimeError(f"Cannot open camera/video source: {self.source}")
@@ -117,6 +124,7 @@ class TrackerPipeline:
                 if not ok:
                     break
 
+                self._update_fps()
                 self._step(frame)
 
                 if self.cfg.display.enabled:
@@ -138,9 +146,11 @@ class TrackerPipeline:
     # ── step ─────────────────────────────────────────────────────────
 
     def _step(self, frame) -> None:
+        accepted_detection = None
         yolo_detection = self._pop_yolo()
         if yolo_detection is not None:
             self._accept_detection(yolo_detection)
+            accepted_detection = yolo_detection
 
         hsv_detection = None
         allow_hsv_init = self.yolo_worker is None
@@ -149,14 +159,26 @@ class TrackerPipeline:
 
         if hsv_detection is not None:
             self._accept_detection(hsv_detection)
+            accepted_detection = hsv_detection
         else:
-            self.state.mark_missing()
+            if accepted_detection is None:
+                self.state.mark_missing()
 
         if self.state.missing_frames > self.cfg.filter.max_missing_frames:
             self.state.reset()
+            self.trail.clear()
+
+        if self.state.ready and self.cfg.display.trail_length > 0:
+            self.trail.append(
+                clamp_point(
+                    self.state.center,
+                    self.cfg.camera.width,
+                    self.cfg.camera.height,
+                )
+            )
 
         # ── 3D 估计 ──────────────────────────────────────────────
-        self._update_3d(hsv_detection)
+        self._update_3d(accepted_detection)
 
         self._maybe_request_yolo(frame)
         self._send_control()
@@ -304,6 +326,11 @@ class TrackerPipeline:
         )
         px, py = clamp_point(pred, width, height)
 
+        if len(self.trail) >= 2:
+            points = list(self.trail)
+            for p1, p2 in zip(points, points[1:]):
+                cv2.line(frame, p1, p2, (255, 0, 255), 2)
+
         # 2D tracking circle
         color = (0, 255, 0) if self.state.source == "HSV" else (255, 0, 0)
         cv2.circle(frame, (cx, cy), max(3, int(self.state.radius)), color, 2)
@@ -314,6 +341,8 @@ class TrackerPipeline:
         lines = [
             f"{self.state.source} conf={self.state.confidence} miss={self.state.missing_frames}",
         ]
+        if self.cfg.display.show_fps:
+            lines.append(f"FPS: {self._display_fps:.1f}")
         # debug: raw radius + depth formula
         if self.state.last_radius_px > 0 and self.calib is not None:
             r = self.state.last_radius_px
@@ -362,6 +391,45 @@ class TrackerPipeline:
         return None
 
     # ── helpers ──────────────────────────────────────────────────────
+
+    def _open_capture(self):
+        if isinstance(self.source, int):
+            cap = cv2.VideoCapture(self.source, cv2.CAP_V4L2)
+            fourcc = self.cfg.camera.fourcc.strip().upper()
+            if fourcc:
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc[:4]))
+        else:
+            cap = cv2.VideoCapture(self.source)
+
+        if self.cfg.camera.buffer_size > 0:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, self.cfg.camera.buffer_size)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.cfg.camera.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.cfg.camera.height)
+        cap.set(cv2.CAP_PROP_FPS, self.cfg.camera.fps)
+
+        actual_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        actual_h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        actual_fps = cap.get(cv2.CAP_PROP_FPS)
+        actual_fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
+        actual_fourcc_text = "".join(
+            chr((actual_fourcc >> (8 * i)) & 0xFF) for i in range(4)
+        )
+        print(
+            "[CAM] "
+            f"{actual_w:.0f}x{actual_h:.0f} @ {actual_fps:.1f}fps "
+            f"fourcc={actual_fourcc_text}"
+        )
+        return cap
+
+    def _update_fps(self) -> None:
+        t = time.monotonic()
+        if self._last_frame_time > 0:
+            dt = max(1e-6, t - self._last_frame_time)
+            fps = 1.0 / dt
+            self._display_fps = fps if self._display_fps <= 0 else (
+                0.85 * self._display_fps + 0.15 * fps
+            )
+        self._last_frame_time = t
 
     @staticmethod
     def _parse_source(source: str):

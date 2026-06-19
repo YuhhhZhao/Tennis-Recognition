@@ -56,22 +56,38 @@ class UartBridge:
         if not self.cfg.enabled or _serial_mod is None:
             return False
         try:
+            print(
+                f"[UART] opening {self.cfg.port} @ {self.cfg.baudrate}...",
+                flush=True,
+            )
             self._ser = _serial_mod.Serial(
                 port=self.cfg.port,
                 baudrate=self.cfg.baudrate,
                 timeout=self.cfg.timeout_s,
                 write_timeout=0.1,
             )
+            print(f"[UART] port opened: {self.cfg.port}", flush=True)
+            if self.cfg.handshake_timeout_s <= 0:
+                print("[UART] RDY wait skipped", flush=True)
+                return True
+
+            print(
+                f"[UART] waiting RDY up to {self.cfg.handshake_timeout_s:.1f}s...",
+                flush=True,
+            )
             t0 = time.monotonic()
-            while time.monotonic() - t0 < 3.0:
+            while time.monotonic() - t0 < self.cfg.handshake_timeout_s:
                 line = self._readline()
                 if line and "RDY" in line:
-                    print(f"[UART] ESP32 ready on {self.cfg.port}")
+                    print(f"[UART] ESP32 ready on {self.cfg.port}", flush=True)
                     return True
-            print(f"[UART] WARNING: no RDY from ESP32, port open but unconfirmed")
+            print(
+                f"[UART] WARNING: no RDY from ESP32, port open but unconfirmed",
+                flush=True,
+            )
             return True
         except _SER_EXC as e:
-            print(f"[UART] ERROR: cannot open {self.cfg.port}: {e}")
+            print(f"[UART] ERROR: cannot open {self.cfg.port}: {e}", flush=True)
             self._ser = None
             return False
 
@@ -160,7 +176,8 @@ class UartBridge:
             if self._ser.in_waiting > 0:
                 line = self._ser.readline()
                 if line:
-                    return line.decode("ascii").strip()
+                    text = line.decode("ascii", errors="ignore").strip()
+                    return text or None
         except _SER_EXC:
             pass
         return None

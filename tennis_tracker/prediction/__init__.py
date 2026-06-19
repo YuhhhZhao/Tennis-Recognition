@@ -14,6 +14,7 @@ from .calibration import (
 from .geometry import (
     CameraIntrinsics,
     CameraPose,
+    camera_to_robot,
     depth_from_ball_radius,
     detect_to_robot_3d,
     pixel_to_camera_frame,
@@ -25,6 +26,7 @@ __all__ = [
     # geometry
     "CameraIntrinsics",
     "CameraPose",
+    "camera_to_robot",
     "depth_from_ball_radius",
     "detect_to_robot_3d",
     "pixel_to_camera_frame",
