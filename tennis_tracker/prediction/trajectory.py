@@ -89,6 +89,24 @@ class TrajectoryFilter:
     def ready(self) -> bool:
         return self._initialized and len(self.history) >= self.cfg.min_samples_for_fit
 
+    def propagate(self, dt: float) -> None:
+        """Prediction-only step (no measurement). Use when ball is lost.
+
+        Advances the state forward by dt seconds using the process model
+        (constant velocity + gravity), and inflates covariance.
+        """
+        if not self._initialized:
+            return
+        if dt <= 0:
+            dt = 0.016
+        if dt > 0.5:
+            return  # gap too large, don't dead-reckon
+        F = self._transition_matrix(dt)
+        B, u = self._control_input(dt)
+        self._x = F @ self._x + B @ u
+        self._P = F @ self._P @ F.T + self._process_noise_cov(dt)
+        self._last_t += dt
+
     def reset(self) -> None:
         self._x = np.zeros((6, 1), dtype=np.float64)
         self._P = np.eye(6, dtype=np.float64) * 100.0
