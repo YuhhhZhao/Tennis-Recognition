@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--measurement-noise", type=float, default=0.15)
     parser.add_argument("--process-noise-vel", type=float, default=0.8)
     parser.add_argument("--target-height", type=float, default=None)
-    parser.add_argument("--send-interval", type=float, default=0.12)
+    parser.add_argument("--send-interval", type=float, default=0.05)
     parser.add_argument("--max-target-distance", type=float, default=10.0)
     parser.add_argument("--min-arrival-time", type=float, default=0.05)
     parser.add_argument("--active-max-missing", type=int, default=30, help="Active-mode frames without usable 3D before re-arm (dead-reckoning enabled).")
@@ -109,7 +109,7 @@ def parse_args() -> argparse.Namespace:
                         help="EMA alpha for speed smoothing in trigger detection.")
 
     # ── Phase 4: reachability ──
-    parser.add_argument("--reachable-max-speed", type=float, default=1.8,
+    parser.add_argument("--reachable-max-speed", type=float, default=1.5,
                         help="Maximum robot speed (m/s) for reachability check.")
 
     # ── Phase 5: latency ──
@@ -614,6 +614,13 @@ def main() -> None:
     _stuck_frames: int = 0
 
     _chase_target: Optional[tuple] = None
+    _chase_px_u: float = 320.0
+    _chase_px_radius: float = 5.0
+    _chase_active_frames: int = 0
+    _chase_stopped: bool = False  # hysteresis for stop/resume
+    _sent_vx: float = 0.0
+    _sent_vy: float = 0.0
+    _sent_w: float = 0.0
 
     # 3D position EMA smoothing (display only, trigger still uses raw)
     smooth_pos_3d: Optional[tuple] = None
@@ -879,9 +886,25 @@ def main() -> None:
                         else:
                             if args.chase:
                                 # ── Chase mode: go directly toward ball, no prediction ──
-                                landing = None  # no ballistic prediction
+                                landing = None
                                 landing_is_late = False
-                                _chase_target = pos_comp  # use compensated ball position
+                                # Store pixel info for centering and distance
+                                _chase_px_u = det_for_3d.center[0]
+                                _chase_px_radius = det_for_3d.radius
+                                # Freeze target when ball lost; reject teleports
+                                if _chase_target is not None:
+                                    old_x, old_y, _ = _chase_target
+                                    jump = math.hypot(pos_comp[0] - old_x, pos_comp[1] - old_y)
+                                    if jump < 0.5:  # no teleport: update smoothly
+                                        alpha = 0.5
+                                        _chase_target = (
+                                            alpha * pos_comp[0] + (1-alpha) * old_x,
+                                            alpha * pos_comp[1] + (1-alpha) * old_y,
+                                            pos_comp[2],
+                                        )
+                                    # else: reject teleport, keep old target
+                                else:
+                                    _chase_target = pos_comp
                             else:
                                 # ── Normal mode: Kalman + ballistic prediction ──
                                 landing = update_trajectory(
@@ -993,6 +1016,13 @@ def main() -> None:
                     missing_after_active = 0
                 else:
                     missing_after_active += 1
+                    # Chase mode: ball lost → stop after 10 consecutive misses (~0.3s)
+                    if args.chase:
+                        _chase_active_frames = 0
+                    if args.chase and uart is not None and missing_after_active >= 10:
+                        uart.send_stop()
+                        _sent_vx, _sent_vy, _sent_w = 0.0, 0.0, 0.0
+                        _chase_target = None
                     # ── Dead-reckon: propagate Kalman without measurement ──
                     if not args.chase and traj_filter._initialized:
                         dt_since_last = now_t - traj_filter._last_t
@@ -1044,9 +1074,10 @@ def main() -> None:
                 else:
                     lx, ly, lz = landing.pos
 
-                # ── Stuck / timeout detection ──
-                # 1. Landing point barely moving → false positive
-                if _last_landing_pos is not None:
+                # ── Stuck / timeout detection (prediction mode only) ──
+                if args.chase:
+                    _last_landing_pos = None  # reset, not used in chase
+                elif _last_landing_pos is not None:
                     plx, ply, _ = _last_landing_pos
                     if math.hypot(lx - plx, ly - ply) < 0.10:
                         _stuck_frames += 1
@@ -1056,8 +1087,8 @@ def main() -> None:
                 if _stuck_frames > 30:  # ~1s
                     rearm(f"stuck landing (false positive) for {_stuck_frames} frames")
                     continue
-                # 2. ACTIVE for too long without ball moving → timeout
-                if landing_count > 150:  # ~5s, ball should have landed by now
+                # 2. ACTIVE for too long without ball moving → timeout (prediction only)
+                if not args.chase and landing_count > 150:
                     rearm(f"active timeout ({landing_count} landings)")
                     continue
                 vx, vy, vz = traj_filter.velocity if not args.chase else (0.0, 0.0, 0.0)
@@ -1066,12 +1097,10 @@ def main() -> None:
                 if args.chase:
                     safe = True
                     should_send = True
-                    send_t = 0.1  # dummy, will be overridden
                 else:
                     landing_is_late = landing.t_arrival < args.min_arrival_time
                     safe = is_safe_landing(landing, args) and not landing_is_late
                     should_send = safe
-                    send_t = landing.t_arrival
 
                 best_x, best_y = lx, ly
 
@@ -1082,20 +1111,51 @@ def main() -> None:
                     if abs_x < 0.02 and abs_y < 0.02:
                         pass  # too close
                     else:
-                        # Compute max-speed target, preserving direction ratio.
-                        # Firmware: vx=clamp(x/t,1.8), vy=clamp(y/t,1.5). t=0.01 < MIN_T → uses signs.
-                        ratio_val = abs_y / max(abs_x, 0.001)
-                        if ratio_val <= 1.5 / 1.8:
-                            vx = 1.8 * (1.0 if best_x > 0 else -1.0)
-                            vy = vx * (send_yy / max(abs(best_x), 0.001))
+                        # Compute target velocity. Dominant axis at max,
+                        raw_x, raw_y = best_x, send_yy
+                        abs_x, abs_y_f = abs(raw_x), abs(raw_y)
+                        if args.chase:
+                            # ── Chase: VEL + pixel centering + radius stop ──
+                            px_err = (_chase_px_u - 320.0) / 320.0
+                            w = -1.5 * px_err
+                            w = max(-1.5, min(1.5, w))
+                            if _chase_px_radius > 60:
+                                uart.send_stop(); sent = True; _chase_stopped = True
+                                _sent_vx = _sent_vy = _sent_w = 0.0
+                            elif _chase_stopped and _chase_px_radius > 40:
+                                uart.send_stop(); sent = True
+                                _sent_vx = _sent_vy = _sent_w = 0.0
+                            elif abs_x < 0.03 and abs_y_f < 0.03:
+                                uart.send_stop(); sent = True
+                                _sent_vx = _sent_vy = _sent_w = 0.0
+                            else:
+                                _chase_stopped = False
+                                if abs_y_f < 0.15: raw_y = 0.0
+                                MS = 0.25
+                                r = abs_y_f / max(abs_x, 0.001)
+                                if r <= 1.0:
+                                    vx = MS*(1 if raw_x>0 else -1); vy = vx*raw_y/max(abs_x,0.001)
+                                else:
+                                    vy = MS*(1 if raw_y>0 else -1); vx = vy*raw_x/max(abs_y_f,0.001)
+                                d = math.hypot(raw_x, raw_y)
+                                if d < 0.3: s=max(0,min(1,(d-0.1)/0.2)); vx*=s; vy*=s
+                                _chase_active_frames += 1
+                                vx *= min(1,_chase_active_frames/10.0)
+                                tr = abs(w)/1.5; vx*=(1-tr*0.8); vy*=(1-tr*0.8)
+                                sent = uart.send_vel(vx, vy, w)
+                                _sent_vx, _sent_vy, _sent_w = vx, vy, w
                         else:
-                            vy = 1.5 * (1.0 if send_yy > 0 else -1.0)
-                            vx = vy * (best_x / max(abs(send_yy), 0.001))
-                        target_x = vx * 0.01
-                        target_y = vy * 0.01
-                        sent = uart.send_target(target_x, target_y, 0.01)
-                        best_x, best_y = target_x, target_y
-                        send_t = 0.01
+                            # ── Prediction: TARGET with arrival time ──
+                            w = 0.0
+                            if abs_x > 0.02 or abs_y_f > 0.02:
+                                t_x = abs_x/1.5 if abs_x>0.01 else 0
+                                t_y = abs_y_f/1.5 if abs_y_f>0.01 else 0
+                                s_t = max(t_x, t_y, 0.06)
+                                s_t = min(s_t, landing.t_arrival if landing is not None else 1.0)
+                                sent = uart.send_target(raw_x, raw_y, s_t)
+                            else:
+                                uart.send_stop(); sent = True
+                            _sent_vx = _sent_vy = _sent_w = 0.0
                     last_send_t = now_t
                     # ── Phase 5c: decouple UART read (every 4th send) ──
                     if landing_count % 4 == 0:
@@ -1104,7 +1164,7 @@ def main() -> None:
                             print(f"[UART] {resp}", flush=True)
 
                 if args.chase:
-                    status = "chase"
+                    status = f"px={_chase_px_u:.0f} r={_chase_px_radius:.0f}"
                 elif landing_is_late:
                     status = f"late(streak={landing_too_soon_streak})"
                 elif safe:
@@ -1112,12 +1172,10 @@ def main() -> None:
                 else:
                     status = "unsafe"
                 target_str = ""
-                target_y_display = -best_y if args.flip_y else best_y
-                if args.flip_y or (not args.chase and send_t != landing.t_arrival):
-                    parts = [f"target=({best_x:+.2f},{target_y_display:+.2f})"]
-                    if not args.chase and send_t != landing.t_arrival:
-                        parts.append(f"t={send_t:.2f}s")
-                    target_str = " ".join(parts)
+                if args.flip_y:
+                    target_str = f"Yflip=({best_x:+.2f},{-best_y:+.2f})"
+                if sent:
+                    target_str += f" VEL=({_sent_vx:.2f},{_sent_vy:.2f},{_sent_w:.2f})"
                 label = "CHASE" if args.chase else "LAND"
                 vel_str = f"vel=({vx:+.2f},{vy:+.2f},{vz:+.2f}) " if not args.chase else ""
                 t_str = f"t={landing.t_arrival:.2f}s conf={landing.confidence:.2f} " if not args.chase else ""
