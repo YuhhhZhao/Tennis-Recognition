@@ -33,6 +33,14 @@ from tennis_tracker.prediction import (
 )
 from tennis_tracker.state import Detection, Detection3D, LandingPoint, TrackState
 
+# ── IMU + odometry localization (optional) ──
+try:
+    from tennis_robot_sim.estimation.odometry import OdomTracker
+    from tennis_robot_sim.imu import ComplementaryLocalizer, WitMotionIMU
+    _LOC_AVAILABLE = True
+except ImportError:
+    _LOC_AVAILABLE = False
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -52,6 +60,7 @@ def parse_args() -> argparse.Namespace:
                         help="Serve MJPEG HTTP stream at --http-stream-port (no X11 needed).")
     parser.add_argument("--http-stream-port", type=int, default=8080,
                         help="Port for MJPEG HTTP stream.")
+    parser.add_argument("--chase", action="store_true", help="Chase mode: go directly toward ball at max speed, skip landing prediction.")
     parser.add_argument("--flip-y", action="store_true", help="Negate Y in TARGET commands (if car moves opposite direction).")
     parser.add_argument("--enable-control", action="store_true", help="Actually send TARGET to ESP32.")
     parser.add_argument("--uart-port", default=None)
@@ -497,6 +506,37 @@ def main() -> None:
     else:
         print("[UART] dry-run: no TARGET will be sent. Add --enable-control to move car.", flush=True)
 
+    # ── IMU + Odometry localization ──
+    odom: Optional[Any] = None
+    imu: Optional[Any] = None
+    localizer: Optional[Any] = None
+    _loc_last_t: float = 0.0
+    _last_odom_query: float = 0.0
+    _robot_x: float = 0.0
+    _robot_y: float = 0.0
+    _robot_yaw: float = 0.0
+    if _LOC_AVAILABLE:
+        from tennis_robot_sim.data import ControlCommand as SimCmd, RobotState as SimState
+        odom = OdomTracker()
+        localizer = ComplementaryLocalizer({
+            "robot": {"start_pose": [0.0, 0.0, 0.0]},
+            "imu": {"yaw_complementary_alpha": 0.92},
+        })
+        localizer.reset()
+        try:
+            imu = WitMotionIMU("/dev/ttyACM0", 115200)
+            if imu.open():
+                _loc_last_t = time.monotonic()
+                print("[LOC] IMU + odometry localization enabled", flush=True)
+            else:
+                print("[LOC] IMU open failed, localization disabled", flush=True)
+                imu = None
+                localizer = None
+        except Exception as e:
+            print(f"[LOC] IMU init error: {e}", flush=True)
+            imu = None
+            localizer = None
+
     # ── HTTP MJPEG stream ──
     http_server: Optional[HTTPServer] = None
     if args.http_stream:
@@ -573,6 +613,8 @@ def main() -> None:
     _last_landing_pos: Optional[tuple] = None
     _stuck_frames: int = 0
 
+    _chase_target: Optional[tuple] = None
+
     # 3D position EMA smoothing (display only, trigger still uses raw)
     smooth_pos_3d: Optional[tuple] = None
     _pos_ema_alpha: float = 0.4  # lower = smoother, higher = more responsive
@@ -619,6 +661,8 @@ def main() -> None:
         bounce_count = 0
         _prev_vz = 0.0
         _bounce_cooldown = 0
+        nonlocal _chase_target
+        _chase_target = None
         traj_filter.reset()
         state.reset()
         trigger_samples.clear()
@@ -645,6 +689,35 @@ def main() -> None:
                 instant = 1.0 / max(1e-6, now_t - last_frame_t)
                 fps = instant if fps <= 0 else 0.85 * fps + 0.15 * instant
             last_frame_t = now_t
+
+            # ── Localization update (IMU + odometry) ──
+            _robot_dx, _robot_dy = 0.0, 0.0
+            if localizer is not None and imu is not None:
+                dt_loc = now_t - _loc_last_t
+                _loc_last_t = now_t
+                if dt_loc > 0 and dt_loc < 0.5:
+                    # 1. IMU: gyro → yaw rate
+                    sample = imu.get_sample()
+                    if sample is not None:
+                        localizer.predict(SimCmd(v=0, omega=sample.yaw_rate_radps), dt_loc)
+                        localizer.update_imu(sample, dt_loc)
+                # 2. Odometry: ping ESP32 every ~100ms
+                if uart is not None and now_t - _last_odom_query > 0.1:
+                    steps = uart.send_ping()
+                    _last_odom_query = now_t
+                    if steps is not None and odom is not None:
+                        odom.update(steps.to_tuple())
+                        ox, oy, oyaw = odom.pose
+                        localizer.update_odometry(
+                            SimState(x=ox, y=oy, yaw=oyaw, v=0, omega=0, timestamp=now_t),
+                            weight=0.15,
+                        )
+                # 3. Track robot displacement since last frame
+                loc_state = localizer.get_state()
+                prev_x, prev_y = _robot_x, _robot_y
+                _robot_x, _robot_y, _robot_yaw = loc_state.x, loc_state.y, loc_state.yaw
+                _robot_dx = _robot_x - prev_x
+                _robot_dy = _robot_y - prev_y
 
             got_usable_3d = False
             in_rearm_cooldown = now_t < rearm_until_t
@@ -717,19 +790,21 @@ def main() -> None:
                         last_valid_3d_t = det_for_3d.timestamp
                         _reject_count = 0
 
-                        # EMA smooth for display
+                        # Compensate for robot motion since last frame
+                        pos_comp = (pos[0] + _robot_dx, pos[1] + _robot_dy, pos[2])
+
+                        # EMA smooth for display (use compensated pos)
                         if smooth_pos_3d is None:
-                            smooth_pos_3d = pos
+                            smooth_pos_3d = pos_comp
                         else:
                             sx, sy, sz = smooth_pos_3d
                             smooth_pos_3d = (
-                                _pos_ema_alpha * pos[0] + (1.0 - _pos_ema_alpha) * sx,
-                                _pos_ema_alpha * pos[1] + (1.0 - _pos_ema_alpha) * sy,
-                                _pos_ema_alpha * pos[2] + (1.0 - _pos_ema_alpha) * sz,
+                                _pos_ema_alpha * pos_comp[0] + (1.0 - _pos_ema_alpha) * sx,
+                                _pos_ema_alpha * pos_comp[1] + (1.0 - _pos_ema_alpha) * sy,
+                                _pos_ema_alpha * pos_comp[2] + (1.0 - _pos_ema_alpha) * sz,
                             )
-
                         det_3d = Detection3D(
-                            pos=pos,
+                            pos=pos_comp,
                             confidence=det_for_3d.confidence,
                             timestamp=det_for_3d.timestamp,
                             radius_px=median_r,
@@ -771,26 +846,27 @@ def main() -> None:
                                 bounce_count = 0
                                 _prev_vz = 0.0
                                 _bounce_cooldown = 0
-                                traj_filter.reset()
-                                state.history_3d.clear()
+                                _chase_target = None
                                 seed = list(trigger_samples)[-max(2, args.seed_samples):]
                                 trigger_rejected = False
-                                for sample in seed:
-                                    landing = update_trajectory(
-                                        sample, traj_filter, ballistic, state, cfg.trajectory.max_history
-                                    )
-                                # ── Phase 3: bootstrap Kalman velocity from seed samples ──
-                                if len(seed) >= 2:
-                                    dt_seed = seed[1].timestamp - seed[0].timestamp
-                                    if dt_seed > 1e-6:
-                                        traj_filter._x[3, 0] = (seed[1].pos[0] - seed[0].pos[0]) / dt_seed
-                                        traj_filter._x[4, 0] = (seed[1].pos[1] - seed[0].pos[1]) / dt_seed
-                                        traj_filter._x[5, 0] = (seed[1].pos[2] - seed[0].pos[2]) / dt_seed
-                                if landing is not None:
-                                    landing_deadline_t = now_t + landing.t_arrival
-                                    if landing.t_arrival < args.min_arrival_time:
-                                        trigger_rejected = True
-                                        rearm(f"landing too soon t={landing.t_arrival:.2f}s")
+                                if not args.chase:
+                                    traj_filter.reset()
+                                    state.history_3d.clear()
+                                    for sample in seed:
+                                        landing = update_trajectory(
+                                            sample, traj_filter, ballistic, state, cfg.trajectory.max_history
+                                        )
+                                    if len(seed) >= 2:
+                                        dt_seed = seed[1].timestamp - seed[0].timestamp
+                                        if dt_seed > 1e-6:
+                                            traj_filter._x[3, 0] = (seed[1].pos[0] - seed[0].pos[0]) / dt_seed
+                                            traj_filter._x[4, 0] = (seed[1].pos[1] - seed[0].pos[1]) / dt_seed
+                                            traj_filter._x[5, 0] = (seed[1].pos[2] - seed[0].pos[2]) / dt_seed
+                                    if landing is not None:
+                                        landing_deadline_t = now_t + landing.t_arrival
+                                        if landing.t_arrival < args.min_arrival_time:
+                                            trigger_rejected = True
+                                            rearm(f"landing too soon t={landing.t_arrival:.2f}s")
                                 if not trigger_rejected:
                                     trig_mode = "fast" if current_speed >= args.trigger_fast_speed else "normal"
                                     print(
@@ -801,9 +877,17 @@ def main() -> None:
                                         flush=True,
                                     )
                         else:
-                            landing = update_trajectory(
-                                det_3d, traj_filter, ballistic, state, cfg.trajectory.max_history
-                            )
+                            if args.chase:
+                                # ── Chase mode: go directly toward ball, no prediction ──
+                                landing = None  # no ballistic prediction
+                                landing_is_late = False
+                                _chase_target = pos_comp  # use compensated ball position
+                            else:
+                                # ── Normal mode: Kalman + ballistic prediction ──
+                                landing = update_trajectory(
+                                    det_3d, traj_filter, ballistic, state, cfg.trajectory.max_history
+                                )
+                                _chase_target = None
                             if landing is not None:
                                 estimated_arrival_t = now_t + landing.t_arrival
                                 landing_deadline_t = estimated_arrival_t
@@ -862,10 +946,11 @@ def main() -> None:
                             calm_ok = prev_speed <= args.trigger_calm_speed
                             fast_ok = current_speed >= args.trigger_fast_speed
                             trig_type = "fast" if fast_ok else ("normal" if calm_ok else "none")
+                            loc_str = f" loc=({_robot_x:+.2f},{_robot_y:+.2f})" if localizer is not None else ""
                             print(
                                 f"[WAIT] pos=({sx:+.2f},{sy:+.2f},{sz:+.2f}) "
                                 f"speed={current_speed:.2f} base={prev_speed:.2f} "
-                                f"trig={trig_type} delta={speed_delta:.2f} confirm={trigger_confirm_count}/{args.trigger_confirm_frames}",
+                                f"trig={trig_type} delta={speed_delta:.2f} confirm={trigger_confirm_count}/{args.trigger_confirm_frames}{loc_str}",
                                 flush=True,
                             )
                             last_print_t = now_t
@@ -909,7 +994,7 @@ def main() -> None:
                 else:
                     missing_after_active += 1
                     # ── Dead-reckon: propagate Kalman without measurement ──
-                    if traj_filter._initialized:
+                    if not args.chase and traj_filter._initialized:
                         dt_since_last = now_t - traj_filter._last_t
                         if 0 < dt_since_last <= 0.5:
                             traj_filter.propagate(dt_since_last)
@@ -951,9 +1036,13 @@ def main() -> None:
                 if landing_too_soon_streak > 5:
                     rearm(f"persistent landing too soon ({landing_too_soon_streak} frames)")
 
-            if active and landing is not None and now_t - last_print_t >= args.print_interval:
+            chase_ready = args.chase and _chase_target is not None
+            if active and (landing is not None or chase_ready) and now_t - last_print_t >= args.print_interval:
                 landing_count += 1
-                lx, ly, lz = landing.pos
+                if chase_ready:
+                    lx, ly, lz = _chase_target
+                else:
+                    lx, ly, lz = landing.pos
 
                 # ── Stuck / timeout detection ──
                 # 1. Landing point barely moving → false positive
@@ -971,39 +1060,37 @@ def main() -> None:
                 if landing_count > 150:  # ~5s, ball should have landed by now
                     rearm(f"active timeout ({landing_count} landings)")
                     continue
-                vx, vy, vz = traj_filter.velocity
+                vx, vy, vz = traj_filter.velocity if not args.chase else (0.0, 0.0, 0.0)
 
-                # Determine status: check if this landing is too soon (late)
-                landing_is_late = landing.t_arrival < args.min_arrival_time
+                # ── Phase 4: safety / reachability ──
+                if args.chase:
+                    safe = True
+                    should_send = True
+                    send_t = 0.1  # dummy, will be overridden
+                else:
+                    landing_is_late = landing.t_arrival < args.min_arrival_time
+                    safe = is_safe_landing(landing, args) and not landing_is_late
+                    should_send = safe
+                    send_t = landing.t_arrival
 
-                # ── Phase 4: reachability check ──
-                safe = is_safe_landing(landing, args) and not landing_is_late
-                reachable = is_reachable(landing, max_robot_speed=args.reachable_max_speed) if safe else False
-                should_send = safe  # always try, even if unreachable
-
-                # Always send raw landing point (no best-effort downscaling).
-                # The car runs at max speed via t-scaling below.
                 best_x, best_y = lx, ly
 
                 sent = False
-                send_t = landing.t_arrival
                 if should_send and uart is not None and now_t - last_send_t >= args.send_interval:
                     send_yy = -best_y if args.flip_y else best_y
-                    # Always send at max speed, preserving direction ratio.
-                    # Scale target so dominant axis runs at firmware MAX (1.8/1.5).
                     abs_x, abs_y = abs(best_x), abs(send_yy)
                     if abs_x < 0.02 and abs_y < 0.02:
-                        pass  # too close, don't move
+                        pass  # too close
                     else:
-                        # Preserve direction: compute speeds that respect the ratio
-                        ratio = abs_y / max(abs_x, 0.001)
-                        if ratio <= 1.5 / 1.8:
+                        # Compute max-speed target, preserving direction ratio.
+                        # Firmware: vx=clamp(x/t,1.8), vy=clamp(y/t,1.5). t=0.01 < MIN_T → uses signs.
+                        ratio_val = abs_y / max(abs_x, 0.001)
+                        if ratio_val <= 1.5 / 1.8:
                             vx = 1.8 * (1.0 if best_x > 0 else -1.0)
                             vy = vx * (send_yy / max(abs(best_x), 0.001))
                         else:
                             vy = 1.5 * (1.0 if send_yy > 0 else -1.0)
                             vx = vy * (best_x / max(abs(send_yy), 0.001))
-                        # Send with t=0.01 (<MIN_T=0.05) so firmware uses vx/vy directly
                         target_x = vx * 0.01
                         target_y = vy * 0.01
                         sent = uart.send_target(target_x, target_y, 0.01)
@@ -1016,7 +1103,9 @@ def main() -> None:
                         if resp:
                             print(f"[UART] {resp}", flush=True)
 
-                if landing_is_late:
+                if args.chase:
+                    status = "chase"
+                elif landing_is_late:
                     status = f"late(streak={landing_too_soon_streak})"
                 elif safe:
                     status = "safe"
@@ -1024,16 +1113,18 @@ def main() -> None:
                     status = "unsafe"
                 target_str = ""
                 target_y_display = -best_y if args.flip_y else best_y
-                if args.flip_y or send_t != landing.t_arrival:
+                if args.flip_y or (not args.chase and send_t != landing.t_arrival):
                     parts = [f"target=({best_x:+.2f},{target_y_display:+.2f})"]
-                    if send_t != landing.t_arrival:
+                    if not args.chase and send_t != landing.t_arrival:
                         parts.append(f"t={send_t:.2f}s")
                     target_str = " ".join(parts)
+                label = "CHASE" if args.chase else "LAND"
+                vel_str = f"vel=({vx:+.2f},{vy:+.2f},{vz:+.2f}) " if not args.chase else ""
+                t_str = f"t={landing.t_arrival:.2f}s conf={landing.confidence:.2f} " if not args.chase else ""
                 print(
-                    f"[LAND#{landing_count:04d}] "
+                    f"[{label}#{landing_count:04d}] "
                     f"pos=({lx:+.2f},{ly:+.2f},{lz:+.2f}) "
-                    f"t={landing.t_arrival:.2f}s conf={landing.confidence:.2f} "
-                    f"vel=({vx:+.2f},{vy:+.2f},{vz:+.2f}) "
+                    f"{t_str}{vel_str}"
                     f"{'SENT' if sent else 'DRY' if uart is None else 'HELD'} "
                     f"{status} {target_str}",
                     flush=True,
@@ -1063,6 +1154,8 @@ def main() -> None:
                 uart.send_stop()
                 time.sleep(0.03)
             uart.close()
+        if imu is not None:
+            imu.close()
         if http_server is not None:
             http_server.shutdown()
         cv2.destroyAllWindows()
