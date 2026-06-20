@@ -52,20 +52,21 @@ def parse_args() -> argparse.Namespace:
                         help="Serve MJPEG HTTP stream at --http-stream-port (no X11 needed).")
     parser.add_argument("--http-stream-port", type=int, default=8080,
                         help="Port for MJPEG HTTP stream.")
+    parser.add_argument("--flip-y", action="store_true", help="Negate Y in TARGET commands (if car moves opposite direction).")
     parser.add_argument("--enable-control", action="store_true", help="Actually send TARGET to ESP32.")
     parser.add_argument("--uart-port", default=None)
     parser.add_argument("--baudrate", type=int, default=None)
     parser.add_argument("--uart-handshake-timeout", type=float, default=0.5, help="Seconds to wait for ESP32 RDY after opening UART.")
-    parser.add_argument("--trigger-speed", type=float, default=0.7, help="Current 3D speed threshold, m/s.")
-    parser.add_argument("--trigger-delta", type=float, default=0.25, help="Speed jump threshold, m/s.")
-    parser.add_argument("--trigger-window", type=int, default=8, help="Recent 3D samples used for speed-jump trigger.")
+    parser.add_argument("--trigger-speed", type=float, default=0.4, help="Current 3D speed threshold, m/s.")
+    parser.add_argument("--trigger-delta", type=float, default=0.15, help="Speed jump threshold, m/s.")
+    parser.add_argument("--trigger-window", type=int, default=12, help="Recent 3D samples used for speed-jump trigger.")
     parser.add_argument("--min-samples", type=int, default=4, help="Trajectory samples before landing prediction.")
     parser.add_argument("--seed-samples", type=int, default=4, help="Samples to seed trajectory after trigger.")
     parser.add_argument("--measurement-noise", type=float, default=0.15)
     parser.add_argument("--process-noise-vel", type=float, default=0.8)
     parser.add_argument("--target-height", type=float, default=None)
     parser.add_argument("--send-interval", type=float, default=0.12)
-    parser.add_argument("--max-target-distance", type=float, default=4.0)
+    parser.add_argument("--max-target-distance", type=float, default=10.0)
     parser.add_argument("--min-arrival-time", type=float, default=0.05)
     parser.add_argument("--active-max-missing", type=int, default=30, help="Active-mode frames without usable 3D before re-arm (dead-reckoning enabled).")
     parser.add_argument("--rearm-grace", type=float, default=0.25, help="Seconds after predicted landing arrival before STOP and re-arm.")
@@ -91,11 +92,15 @@ def parse_args() -> argparse.Namespace:
     # ── Phase 2: trigger confirmation ──
     parser.add_argument("--trigger-confirm-frames", type=int, default=2,
                         help="Consecutive frames meeting trigger condition required to activate.")
+    parser.add_argument("--trigger-calm-speed", type=float, default=0.45,
+                        help="Baseline speed must be below this to allow trigger (m/s, prevents hand-wave false triggers).")
+    parser.add_argument("--trigger-fast-speed", type=float, default=1.0,
+                        help="If current speed exceeds this, trigger immediately without calm check (m/s, for balls already in flight).")
     parser.add_argument("--speed-ema-alpha", type=float, default=0.3,
                         help="EMA alpha for speed smoothing in trigger detection.")
 
     # ── Phase 4: reachability ──
-    parser.add_argument("--reachable-max-speed", type=float, default=1.5,
+    parser.add_argument("--reachable-max-speed", type=float, default=1.8,
                         help="Maximum robot speed (m/s) for reachability check.")
 
     # ── Phase 5: latency ──
@@ -549,6 +554,11 @@ def main() -> None:
     # Phase 2: trigger confirmation
     trigger_confirm_count: int = 0
 
+    # Bounce tracking
+    bounce_count: int = 0
+    _prev_vz: float = 0.0
+    _bounce_cooldown: int = 0  # frames to suppress re-triggering same bounce
+
     # Phase 5: YOLO frame skip
     yolo_frame_counter: int = 0
 
@@ -558,6 +568,10 @@ def main() -> None:
     # Debug: track rejected 3D positions to avoid log spam
     _reject_count: int = 0
     _last_reject_print: float = 0.0
+
+    # Stuck detection: if landing point barely moves for too long, it's a false positive
+    _last_landing_pos: Optional[tuple] = None
+    _stuck_frames: int = 0
 
     # 3D position EMA smoothing (display only, trigger still uses raw)
     smooth_pos_3d: Optional[tuple] = None
@@ -595,6 +609,16 @@ def main() -> None:
         nonlocal _last_reject_print
         _reject_count = 0
         _last_reject_print = 0.0
+        nonlocal _last_landing_pos
+        nonlocal _stuck_frames
+        _last_landing_pos = None
+        _stuck_frames = 0
+        nonlocal bounce_count
+        nonlocal _prev_vz
+        nonlocal _bounce_cooldown
+        bounce_count = 0
+        _prev_vz = 0.0
+        _bounce_cooldown = 0
         traj_filter.reset()
         state.reset()
         trigger_samples.clear()
@@ -719,11 +743,20 @@ def main() -> None:
 
                         if not active:
                             # ── Phase 2b: trigger with confirmation counter ──
-                            condition_met = (
+                            # Two trigger paths:
+                            # 1. Normal: ball was calm, then accelerated (calm baseline + speed jump)
+                            # 2. Fast: ball already in flight at high speed (skip calm check)
+                            normal_trigger = (
                                 len(trigger_samples) >= max(4, args.trigger_window // 2)
+                                and prev_speed <= args.trigger_calm_speed
                                 and current_speed >= args.trigger_speed
                                 and speed_delta >= args.trigger_delta
                             )
+                            fast_trigger = (
+                                len(trigger_samples) >= 3  # fewer samples needed for fast balls
+                                and current_speed >= args.trigger_fast_speed
+                            )
+                            condition_met = normal_trigger or fast_trigger
                             if condition_met:
                                 trigger_confirm_count += 1
                             else:
@@ -735,6 +768,9 @@ def main() -> None:
                                 landing_deadline_t = None
                                 landing_count = 0
                                 last_send_t = 0.0
+                                bounce_count = 0
+                                _prev_vz = 0.0
+                                _bounce_cooldown = 0
                                 traj_filter.reset()
                                 state.history_3d.clear()
                                 seed = list(trigger_samples)[-max(2, args.seed_samples):]
@@ -756,8 +792,9 @@ def main() -> None:
                                         trigger_rejected = True
                                         rearm(f"landing too soon t={landing.t_arrival:.2f}s")
                                 if not trigger_rejected:
+                                    trig_mode = "fast" if current_speed >= args.trigger_fast_speed else "normal"
                                     print(
-                                        "\n[TRIGGER] speed jump confirmed "
+                                        f"\n[TRIGGER] speed jump confirmed ({trig_mode}) "
                                         f"prev={prev_speed:.2f} current={current_speed:.2f} "
                                         f"delta={speed_delta:.2f}m/s seed={len(seed)} "
                                         f"confirm={trigger_confirm_count}",
@@ -772,20 +809,63 @@ def main() -> None:
                                 landing_deadline_t = estimated_arrival_t
                                 if landing.t_arrival < args.min_arrival_time:
                                     # Don't rearm immediately — Kalman may still be converging.
-                                    # Only rearm if too-short persists for many consecutive frames.
                                     landing_too_soon_streak += 1
                                 else:
                                     landing_too_soon_streak = 0
-                            else:
-                                # No prediction yet (e.g. Kalman not ready) — not a failure
-                                pass
+
+                                # ── Bounce detection: two methods ──
+                                _, _, kf_z = traj_filter.position
+                                _, _, kf_vz = traj_filter.velocity
+                                _bounce_cooldown = max(0, _bounce_cooldown - 1)
+                                # Method 1: vz reversal near ground (ball falling → rising)
+                                near_ground = kf_z < 0.35
+                                was_falling = _prev_vz < -0.3
+                                now_rising_or_slow = kf_vz > -0.3
+                                bounce1 = (_bounce_cooldown <= 0 and near_ground
+                                           and was_falling and now_rising_or_slow)
+                                # Method 2: z crossed below ground threshold with downward velocity
+                                prev_z = traj_filter._x[2, 0]
+                                z_crossed_ground = (kf_z < 0.08 and _prev_vz < -0.2)
+                                bounce2 = (_bounce_cooldown <= 0 and z_crossed_ground
+                                           and bounce_count == 0)  # first bounce only for method 2
+                                # Debug: print bounce status every second
+                                if near_ground and now_t - _last_reject_print > 0.5:
+                                    print(
+                                        f"[BOUNCE?] z={kf_z:.3f} vz={kf_vz:.2f}(prev={_prev_vz:.2f}) "
+                                        f"fall={was_falling} slow={now_rising_or_slow} "
+                                        f"b1={bounce1} b2={bounce2} cd={_bounce_cooldown}",
+                                        flush=True,
+                                    )
+                                    _last_reject_print = now_t
+                                if bounce1 or bounce2:
+                                    bounce_count += 1
+                                    _bounce_cooldown = 5
+                                    # Dampen all velocity components (ball loses energy on bounce)
+                                    bounce_vz = max(abs(_prev_vz) * 0.55, 0.5)
+                                    traj_filter._x[5, 0] = bounce_vz
+                                    traj_filter._x[3, 0] *= 0.7  # horizontal drag
+                                    traj_filter._x[4, 0] *= 0.7
+                                    # Don't force z to 0.03 — use actual Kalman position
+                                    landing = ballistic.solve(traj_filter)
+                                    if landing is not None:
+                                        landing_deadline_t = now_t + landing.t_arrival
+                                    print(
+                                        f"\n[BOUNCE#{bounce_count}] "
+                                        f"z={kf_z:.3f} vz={_prev_vz:.2f}→{traj_filter._x[5,0]:.2f} "
+                                        + (f"land=({landing.pos[0]:.2f},{landing.pos[1]:.2f}) t={landing.t_arrival:.2f}s" if landing else ""),
+                                        flush=True,
+                                    )
+                            _prev_vz = traj_filter.velocity[2]
 
                         if not active and now_t - last_print_t >= args.print_interval:
                             sx, sy, sz = smooth_pos_3d if smooth_pos_3d is not None else pos
+                            calm_ok = prev_speed <= args.trigger_calm_speed
+                            fast_ok = current_speed >= args.trigger_fast_speed
+                            trig_type = "fast" if fast_ok else ("normal" if calm_ok else "none")
                             print(
                                 f"[WAIT] pos=({sx:+.2f},{sy:+.2f},{sz:+.2f}) "
-                                f"speed={current_speed:.2f} delta={speed_delta:.2f} "
-                                f"confirm={trigger_confirm_count}/{args.trigger_confirm_frames}",
+                                f"speed={current_speed:.2f} base={prev_speed:.2f} "
+                                f"trig={trig_type} delta={speed_delta:.2f} confirm={trigger_confirm_count}/{args.trigger_confirm_frames}",
                                 flush=True,
                             )
                             last_print_t = now_t
@@ -833,6 +913,30 @@ def main() -> None:
                         dt_since_last = now_t - traj_filter._last_t
                         if 0 < dt_since_last <= 0.5:
                             traj_filter.propagate(dt_since_last)
+                            # ── Bounce check in dead-reckoning ──
+                            kf_z = traj_filter._x[2, 0]
+                            kf_vz = traj_filter._x[5, 0]
+                            _bounce_cooldown = max(0, _bounce_cooldown - 1)
+                            if kf_z < 0.25 and now_t - _last_reject_print > 0.5:
+                                print(
+                                    f"[BOUNCE?] dead-reckon z={kf_z:.3f} vz={kf_vz:.2f} "
+                                    f"prev_vz={_prev_vz:.2f} cd={_bounce_cooldown}",
+                                    flush=True,
+                                )
+                                _last_reject_print = now_t
+                            if (_bounce_cooldown <= 0 and kf_z < 0.10
+                                    and _prev_vz < -0.3 and kf_vz < -0.3):
+                                bounce_count += 1
+                                _bounce_cooldown = 5
+                                traj_filter._x[5, 0] = max(abs(_prev_vz) * 0.55, 0.5)
+                                traj_filter._x[3, 0] *= 0.7
+                                traj_filter._x[4, 0] *= 0.7
+                                print(
+                                    f"\n[BOUNCE#{bounce_count}] propagate "
+                                    f"z={kf_z:.3f} vz={_prev_vz:.2f}→{traj_filter._x[5,0]:.2f}",
+                                    flush=True,
+                                )
+                            _prev_vz = traj_filter._x[5, 0]
                             landing = ballistic.solve(traj_filter)
                             if landing is not None:
                                 landing_deadline_t = now_t + landing.t_arrival
@@ -850,28 +954,61 @@ def main() -> None:
             if active and landing is not None and now_t - last_print_t >= args.print_interval:
                 landing_count += 1
                 lx, ly, lz = landing.pos
+
+                # ── Stuck / timeout detection ──
+                # 1. Landing point barely moving → false positive
+                if _last_landing_pos is not None:
+                    plx, ply, _ = _last_landing_pos
+                    if math.hypot(lx - plx, ly - ply) < 0.10:
+                        _stuck_frames += 1
+                    else:
+                        _stuck_frames = max(0, _stuck_frames - 2)
+                _last_landing_pos = (lx, ly, lz)
+                if _stuck_frames > 30:  # ~1s
+                    rearm(f"stuck landing (false positive) for {_stuck_frames} frames")
+                    continue
+                # 2. ACTIVE for too long without ball moving → timeout
+                if landing_count > 150:  # ~5s, ball should have landed by now
+                    rearm(f"active timeout ({landing_count} landings)")
+                    continue
                 vx, vy, vz = traj_filter.velocity
 
                 # Determine status: check if this landing is too soon (late)
                 landing_is_late = landing.t_arrival < args.min_arrival_time
 
-                # ── Phase 4: reachability check + best-effort fallback ──
+                # ── Phase 4: reachability check ──
                 safe = is_safe_landing(landing, args) and not landing_is_late
                 reachable = is_reachable(landing, max_robot_speed=args.reachable_max_speed) if safe else False
-                should_send = safe  # always try best-effort if safe, even if unreachable
+                should_send = safe  # always try, even if unreachable
 
-                # Best-effort: if unreachable, cap distance to what robot can cover in time
+                # Always send raw landing point (no best-effort downscaling).
+                # The car runs at max speed via t-scaling below.
                 best_x, best_y = lx, ly
-                if safe and not reachable:
-                    dist = math.hypot(lx, ly)
-                    if dist > 0.02:
-                        max_dist = args.reachable_max_speed * 0.85 * landing.t_arrival
-                        scale = max_dist / dist
-                        best_x, best_y = lx * scale, ly * scale
 
                 sent = False
+                send_t = landing.t_arrival
                 if should_send and uart is not None and now_t - last_send_t >= args.send_interval:
-                    sent = uart.send_target(best_x, best_y, landing.t_arrival)
+                    send_yy = -best_y if args.flip_y else best_y
+                    # Always send at max speed, preserving direction ratio.
+                    # Scale target so dominant axis runs at firmware MAX (1.8/1.5).
+                    abs_x, abs_y = abs(best_x), abs(send_yy)
+                    if abs_x < 0.02 and abs_y < 0.02:
+                        pass  # too close, don't move
+                    else:
+                        # Preserve direction: compute speeds that respect the ratio
+                        ratio = abs_y / max(abs_x, 0.001)
+                        if ratio <= 1.5 / 1.8:
+                            vx = 1.8 * (1.0 if best_x > 0 else -1.0)
+                            vy = vx * (send_yy / max(abs(best_x), 0.001))
+                        else:
+                            vy = 1.5 * (1.0 if send_yy > 0 else -1.0)
+                            vx = vy * (best_x / max(abs(send_yy), 0.001))
+                        # Send with t=0.01 (<MIN_T=0.05) so firmware uses vx/vy directly
+                        target_x = vx * 0.01
+                        target_y = vy * 0.01
+                        sent = uart.send_target(target_x, target_y, 0.01)
+                        best_x, best_y = target_x, target_y
+                        send_t = 0.01
                     last_send_t = now_t
                     # ── Phase 5c: decouple UART read (every 4th send) ──
                     if landing_count % 4 == 0:
@@ -881,13 +1018,17 @@ def main() -> None:
 
                 if landing_is_late:
                     status = f"late(streak={landing_too_soon_streak})"
-                elif safe and reachable:
+                elif safe:
                     status = "safe"
-                elif safe and not reachable:
-                    status = f"best({best_x:+.2f},{best_y:+.2f})"
                 else:
                     status = "unsafe"
-                target_str = f"target=({best_x:+.2f},{best_y:+.2f})" if (best_x != lx or best_y != ly) else ""
+                target_str = ""
+                target_y_display = -best_y if args.flip_y else best_y
+                if args.flip_y or send_t != landing.t_arrival:
+                    parts = [f"target=({best_x:+.2f},{target_y_display:+.2f})"]
+                    if send_t != landing.t_arrival:
+                        parts.append(f"t={send_t:.2f}s")
+                    target_str = " ".join(parts)
                 print(
                     f"[LAND#{landing_count:04d}] "
                     f"pos=({lx:+.2f},{ly:+.2f},{lz:+.2f}) "

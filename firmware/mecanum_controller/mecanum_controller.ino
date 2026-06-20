@@ -64,7 +64,7 @@ const float LX = 0.086f, LY = 0.087f, L_SUM = LX + LY;  // 0.173 (IMU校准)
 const float INV_R_DIV_2PI = 1.0f / (WHEEL_RADIUS * 2.0f * PI);
 
 const uint32_t VEL_TIMEOUT_MS = 1000;
-const float MAX_VX = 1.5f, MAX_VY = 1.0f, MIN_T = 0.05f;
+const float MAX_VX = 1.8f, MAX_VY = 1.5f, MIN_T = 0.05f;
 
 // ── ISR 状态 ──
 #define STREAM_HZ 20000

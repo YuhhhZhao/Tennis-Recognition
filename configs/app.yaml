@@ -64,7 +64,7 @@ geometry:
   ball_diameter_m: 0.139      # 标定: 1.2m实测x=1.25→0.145×1.2/1.25=0.139
   camera_height_m: 0.08       # 兼容旧字段; 当前与 camera_offset_z_m 保持一致
   camera_offset_x_m: -0.08     # 相机光心相对机器人原点 X 偏移: 前方为正
-  camera_offset_y_m: 0.10      # 相机光心相对机器人原点 Y 偏移: 左方为正
+  camera_offset_y_m: -0.10      # 相机光心相对机器人原点 Y 偏移: 左方为正 (flipped from original)
   camera_offset_z_m: 0.08      # 相机光心相对机器人原点 Z 偏移: 上方为正
   camera_pitch_deg: 3.0      # 俯仰角 (度), 正值=向下, 负值=向上仰
   camera_yaw_deg: 0.0         # 偏航角 (度), 0 = 正前方
